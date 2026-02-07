@@ -1,0 +1,33 @@
+# Dependencies
+node_modules
+
+# Build output
+dist
+dist-ssr
+target
+
+# Environment
+.env
+.env.local
+*.local
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# Editor
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Tauri generated
+**/src-tauri/gen/
+
+# Clips (user data)
+*.gameclip
+clips/

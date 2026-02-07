@@ -1,0 +1,1 @@
+// .gameclip format read/write

@@ -1,0 +1,10 @@
+{
+  "name": "gameclip",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "dev": "pnpm --filter @gameclip/desktop dev",
+    "build": "pnpm --filter @gameclip/desktop build",
+    "tauri": "pnpm --filter @gameclip/desktop tauri"
+  }
+}
