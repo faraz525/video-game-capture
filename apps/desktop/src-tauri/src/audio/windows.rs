@@ -104,8 +104,9 @@ fn wasapi_capture_loop(
     clock: SyncClock,
     _config: AudioConfig,
 ) -> Result<(), AudioError> {
-    // Initialize COM for this thread
+    // Initialize COM for this thread (returns HRESULT, use .ok() to get Result)
     wasapi::initialize_mta()
+        .ok()
         .map_err(|e| AudioError::Platform(format!("COM init failed: {e}")))?;
 
     // Get default render (output) device for loopback
@@ -126,7 +127,7 @@ fn wasapi_capture_loop(
     let sample_rate = mix_format.get_samplespersec();
     let channels = mix_format.get_nchannels() as u16;
     let sample_type = mix_format
-        .get_sampletype()
+        .get_subformat()
         .map_err(|e| AudioError::Platform(format!("Failed to get sample type: {e}")))?;
 
     // Initialize in shared polling mode for loopback capture.
