@@ -19,6 +19,25 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::core::PCWSTR;
 
+/// Wrapper around HWND raw pointer to allow Send across threads.
+/// HWND is a raw pointer internally, but we only access it under a Mutex,
+/// which makes cross-thread sharing safe for our use case (PostMessageW).
+#[derive(Clone, Copy)]
+struct SendableHwnd(usize);
+
+impl SendableHwnd {
+    fn from_hwnd(hwnd: HWND) -> Self {
+        Self(hwnd.0 as usize)
+    }
+
+    fn to_hwnd(self) -> HWND {
+        HWND(self.0 as *mut _)
+    }
+}
+
+// Safety: We only use the HWND for PostMessageW which is thread-safe.
+unsafe impl Send for SendableHwnd {}
+
 /// Windows input recorder using the Raw Input API.
 ///
 /// Creates a hidden message-only window and registers for keyboard + mouse
@@ -29,11 +48,8 @@ pub struct WindowsInputRecorder {
     running: bool,
     events: Arc<Mutex<Vec<InputEvent>>>,
     /// Handle to the hidden message-only window, used to post WM_QUIT on stop.
-    hwnd: Arc<Mutex<Option<HWND>>>,
+    hwnd: Arc<Mutex<Option<SendableHwnd>>>,
 }
-
-// HWND is a raw pointer wrapper; it's safe to share between threads via Arc<Mutex>.
-unsafe impl Send for WindowsInputRecorder {}
 
 impl WindowsInputRecorder {
     pub fn new(clock: SyncClock) -> Self {
@@ -74,9 +90,9 @@ impl InputRecorder for WindowsInputRecorder {
 
         // Post WM_QUIT to break the message loop
         if let Ok(hwnd_guard) = self.hwnd.lock() {
-            if let Some(hwnd) = *hwnd_guard {
+            if let Some(sendable) = *hwnd_guard {
                 unsafe {
-                    let _ = PostMessageW(hwnd, WM_QUIT, WPARAM(0), LPARAM(0));
+                    let _ = PostMessageW(Some(sendable.to_hwnd()), WM_QUIT, WPARAM(0), LPARAM(0));
                 }
             }
         }
@@ -102,7 +118,7 @@ impl InputRecorder for WindowsInputRecorder {
     }
 }
 
-/// Thread-local state for the raw input window procedure.
+// Thread-local state for the raw input window procedure.
 thread_local! {
     static RAW_INPUT_STATE: std::cell::RefCell<Option<RawInputState>> = const { std::cell::RefCell::new(None) };
 }
@@ -116,7 +132,7 @@ struct RawInputState {
 fn run_raw_input_loop(
     events: Arc<Mutex<Vec<InputEvent>>>,
     clock: SyncClock,
-    hwnd_store: Arc<Mutex<Option<HWND>>>,
+    hwnd_store: Arc<Mutex<Option<SendableHwnd>>>,
 ) -> Result<(), InputError> {
     unsafe {
         let hinstance = GetModuleHandleW(PCWSTR::null())
@@ -148,7 +164,7 @@ fn run_raw_input_loop(
 
         // Store HWND so stop() can post WM_QUIT
         if let Ok(mut store) = hwnd_store.lock() {
-            *store = Some(hwnd);
+            *store = Some(SendableHwnd::from_hwnd(hwnd));
         }
 
         // Register for raw keyboard and mouse input
@@ -220,8 +236,6 @@ unsafe fn process_raw_input(lparam: LPARAM) {
     }
 
     // Use properly aligned buffer via MaybeUninit
-    // RAWINPUT is large enough for keyboard and mouse data; for HID devices
-    // it may be larger, but we only register for keyboard + mouse.
     let mut raw_input = MaybeUninit::<RAWINPUT>::uninit();
     let buf_size = size_of::<RAWINPUT>() as u32;
     let mut actual_size = buf_size.max(size);
@@ -248,7 +262,9 @@ unsafe fn process_raw_input(lparam: LPARAM) {
         let kind = if raw.header.dwType == RIM_TYPEKEYBOARD.0 {
             let kb = raw.data.keyboard;
             let vk = kb.VKey;
-            let pressed = kb.Flags.0 & 0x01 == 0; // RI_KEY_MAKE = 0, RI_KEY_BREAK = 1
+            // RI_KEY_MAKE = 0 (key down), RI_KEY_BREAK = 1 (key up)
+            // Flags is a u16 in windows 0.59
+            let pressed = kb.Flags & 0x01 == 0;
 
             Some(InputEventKind::Key(KeyEvent {
                 key: vk_to_key_string(vk),

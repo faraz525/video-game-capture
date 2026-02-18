@@ -80,6 +80,7 @@ fn detect_from_foreground_window() -> Option<String> {
         OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
     };
     use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+    use windows::core::PWSTR;
 
     unsafe {
         let hwnd = GetForegroundWindow();
@@ -97,7 +98,7 @@ fn detect_from_foreground_window() -> Option<String> {
 
         let mut buf = [0u16; 1024];
         let mut size = buf.len() as u32;
-        let query_result = QueryFullProcessImageNameW(process, PROCESS_NAME_FORMAT(0), &mut buf, &mut size);
+        let query_result = QueryFullProcessImageNameW(process, PROCESS_NAME_FORMAT(0), PWSTR(buf.as_mut_ptr()), &mut size);
 
         // Always close the handle, regardless of query success
         let _ = CloseHandle(process);

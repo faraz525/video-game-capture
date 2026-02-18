@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use wasapi::{AudioClient, Device, Direction, SampleType, ShareMode};
+use wasapi::{DeviceEnumerator, Direction, SampleType, StreamMode};
 
 /// Windows audio capture using WASAPI loopback mode.
 ///
@@ -102,14 +102,17 @@ fn wasapi_capture_loop(
     running: Arc<Mutex<bool>>,
     buffers: Arc<Mutex<VecDeque<AudioBuffer>>>,
     clock: SyncClock,
-    config: AudioConfig,
+    _config: AudioConfig,
 ) -> Result<(), AudioError> {
     // Initialize COM for this thread
     wasapi::initialize_mta()
         .map_err(|e| AudioError::Platform(format!("COM init failed: {e}")))?;
 
     // Get default render (output) device for loopback
-    let device = Device::new_default_device(Direction::Render)
+    let enumerator = DeviceEnumerator::new()
+        .map_err(|e| AudioError::Platform(format!("Failed to create enumerator: {e}")))?;
+    let device = enumerator
+        .get_default_device(&Direction::Render)
         .map_err(|e| AudioError::Platform(format!("Failed to get render device: {e}")))?;
 
     let mut audio_client = device
@@ -126,15 +129,14 @@ fn wasapi_capture_loop(
         .get_sampletype()
         .map_err(|e| AudioError::Platform(format!("Failed to get sample type: {e}")))?;
 
-    // Initialize in shared mode with loopback
+    // Initialize in shared polling mode for loopback capture.
+    // Direction::Render + loopback captures what's being played on the device.
+    let mode = StreamMode::PollingShared {
+        autoconvert: true,
+        buffer_duration_hns: 0, // default buffer
+    };
     audio_client
-        .initialize_client(
-            &mix_format,
-            0,      // period (0 = default)
-            &Direction::Capture,
-            &ShareMode::Shared,
-            true,   // loopback = true
-        )
+        .initialize_client(&mix_format, &Direction::Render, &mode)
         .map_err(|e| AudioError::Platform(format!("Failed to init audio client: {e}")))?;
 
     let capture_client = audio_client
@@ -146,6 +148,7 @@ fn wasapi_capture_loop(
         .map_err(|e| AudioError::Platform(format!("Failed to start stream: {e}")))?;
 
     let poll_interval = Duration::from_millis(10);
+    let mut sample_queue: VecDeque<u8> = VecDeque::new();
 
     loop {
         {
@@ -155,12 +158,14 @@ fn wasapi_capture_loop(
             }
         }
 
-        // Poll for available data
-        match capture_client.get_next_nbr_frames() {
-            Ok(Some(n_frames)) if n_frames > 0 => {
-                match capture_client.read_from_device(n_frames as usize) {
-                    Ok(raw_bytes) => {
-                        let samples = convert_to_f32(&raw_bytes, &sample_type, channels);
+        // Read available data into the queue
+        match capture_client.read_from_device_to_deque(&mut sample_queue) {
+            Ok(_) => {
+                // Process all complete samples from the queue
+                if !sample_queue.is_empty() {
+                    let raw_bytes: Vec<u8> = sample_queue.drain(..).collect();
+                    let samples = convert_to_f32(&raw_bytes, &sample_type, channels);
+                    if !samples.is_empty() {
                         let buffer = AudioBuffer {
                             timestamp_us: clock.now_us(),
                             channels,
@@ -172,16 +177,10 @@ fn wasapi_capture_loop(
                             bufs.push_back(buffer);
                         }
                     }
-                    Err(e) => {
-                        eprintln!("[GameClip] WASAPI read error: {e}");
-                    }
                 }
             }
-            Ok(_) => {
-                // No frames available, wait and retry
-            }
             Err(e) => {
-                eprintln!("[GameClip] WASAPI poll error: {e}");
+                eprintln!("[GameClip] WASAPI read error: {e}");
             }
         }
 
@@ -203,19 +202,14 @@ fn convert_to_f32(raw: &[u8], sample_type: &SampleType, _channels: u16) -> Vec<f
                 .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
                 .collect()
         }
-        SampleType::Int16 => {
+        SampleType::Int => {
+            // WASAPI Int format is typically 16-bit or 32-bit.
+            // The mix format's bits_per_sample tells us which, but since we
+            // only have the raw bytes, try 16-bit (most common for Int).
             raw.chunks_exact(2)
                 .map(|chunk| {
                     let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
                     sample as f32 / i16::MAX as f32
-                })
-                .collect()
-        }
-        SampleType::Int32 => {
-            raw.chunks_exact(4)
-                .map(|chunk| {
-                    let sample = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                    sample as f32 / i32::MAX as f32
                 })
                 .collect()
         }

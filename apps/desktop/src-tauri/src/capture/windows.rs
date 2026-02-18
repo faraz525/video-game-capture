@@ -3,7 +3,7 @@ use crate::sync::clock::SyncClock;
 use std::time::{Duration, Instant};
 use win_desktop_duplication::devices::AdapterFactory;
 use win_desktop_duplication::tex_reader::TextureReader;
-use win_desktop_duplication::{DesktopDuplicationApi, OutputDuplication};
+use win_desktop_duplication::DesktopDuplicationApi;
 
 /// Windows screen capture using DXGI Desktop Duplication API.
 ///
@@ -13,7 +13,7 @@ pub struct WindowsCapture {
     clock: SyncClock,
     config: Option<CaptureConfig>,
     running: bool,
-    duplication: Option<OutputDuplication>,
+    duplication: Option<DesktopDuplicationApi>,
     reader: Option<TextureReader>,
     last_frame_time: Option<Instant>,
 }
@@ -32,18 +32,22 @@ impl WindowsCapture {
 
     /// Initialize or reinitialize the DXGI duplication session.
     fn init_duplication(&mut self) -> Result<(), CaptureError> {
+        win_desktop_duplication::set_process_dpi_awareness();
+        win_desktop_duplication::co_init();
+
         let adapter = AdapterFactory::new()
             .get_adapter_by_idx(0)
-            .map_err(|e| CaptureError::Platform(format!("Failed to get adapter: {e}")))?;
+            .ok_or_else(|| CaptureError::Platform("Failed to get adapter".to_string()))?;
 
         let output = adapter
             .get_display_by_idx(0)
-            .map_err(|e| CaptureError::Platform(format!("Failed to get display: {e}")))?;
+            .ok_or_else(|| CaptureError::Platform("Failed to get display".to_string()))?;
 
-        let duplication = DesktopDuplicationApi::new(adapter, output.clone())
-            .map_err(|e| CaptureError::Platform(format!("Failed to create duplication: {e}")))?;
+        let duplication = DesktopDuplicationApi::new(adapter, output)
+            .map_err(|e| CaptureError::Platform(format!("Failed to create duplication: {e:?}")))?;
 
-        let reader = TextureReader::new(duplication.get_device(), duplication.get_context());
+        let (device, ctx) = duplication.get_device_and_ctx();
+        let reader = TextureReader::new(device, ctx);
 
         self.duplication = Some(duplication);
         self.reader = Some(reader);
@@ -105,11 +109,11 @@ impl ScreenCapture for WindowsCapture {
             .as_mut()
             .ok_or(CaptureError::NotStarted)?;
 
-        // Non-blocking acquire (0ms timeout)
+        // Non-blocking acquire
         let texture = match duplication.acquire_next_frame_now() {
             Ok(tex) => tex,
             Err(e) => {
-                let err_msg = format!("{e}");
+                let err_msg = format!("{e:?}");
                 // Handle AccessLost by reinitializing
                 if err_msg.contains("AccessLost") || err_msg.contains("DXGI_ERROR_ACCESS_LOST") {
                     eprintln!("[GameClip] DXGI access lost, reinitializing...");
@@ -126,19 +130,23 @@ impl ScreenCapture for WindowsCapture {
         };
 
         let reader = self.reader.as_mut().ok_or(CaptureError::NotStarted)?;
-        let mut data = reader.get_data(&mut duplication.get_device(), &texture);
+
+        // get_data writes BGRA pixel data into the provided Vec
+        let mut data = Vec::<u8>::new();
+        if let Err(e) = reader.get_data(&mut data, &texture) {
+            eprintln!("[GameClip] TextureReader error: {e:?}");
+            return Ok(None);
+        }
 
         if data.is_empty() {
             return Ok(None);
         }
 
-        // Use configured dimensions; DXGI delivers at native resolution
-        // so config should always specify width/height.
+        // Use configured dimensions or infer from data
         let total_pixels = data.len() / 4;
         let (width, height) = if config.width > 0 && config.height > 0 {
             (config.width, config.height)
         } else if total_pixels > 0 {
-            // Infer assuming 16:9 aspect ratio
             let w = ((total_pixels as f64 * 16.0 / 9.0).sqrt()).round() as u32;
             let h = total_pixels as u32 / w.max(1);
             (w, h)
