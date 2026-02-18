@@ -1,1 +1,1 @@
-// Game detection module
+pub mod detector;

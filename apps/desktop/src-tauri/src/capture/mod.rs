@@ -26,8 +26,10 @@ pub enum CaptureError {
     #[error("capture already running")]
     AlreadyRunning,
     #[error("no frames available")]
+    #[allow(dead_code)]
     NoFrames,
     #[error("platform error: {0}")]
+    #[allow(dead_code)]
     Platform(String),
 }
 
@@ -65,6 +67,7 @@ pub trait ScreenCapture: Send {
     fn stop(&mut self) -> Result<(), CaptureError>;
 
     /// Returns true if the capture is currently running.
+    #[allow(dead_code)]
     fn is_running(&self) -> bool;
 
     /// Poll for the next available frame. Returns None if no new frame is ready.

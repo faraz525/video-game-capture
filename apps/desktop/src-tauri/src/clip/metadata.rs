@@ -41,6 +41,7 @@ pub struct CaptureDevices {
 }
 
 impl ClipMetadata {
+    #[allow(dead_code)]
     pub fn new(id: String, name: String) -> Self {
         Self {
             id,

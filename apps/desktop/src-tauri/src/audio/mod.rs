@@ -47,6 +47,7 @@ pub enum AudioError {
     #[error("audio capture already running")]
     AlreadyRunning,
     #[error("platform error: {0}")]
+    #[allow(dead_code)]
     Platform(String),
 }
 
@@ -62,6 +63,7 @@ pub trait AudioCapture: Send {
     fn stop(&mut self) -> Result<(), AudioError>;
 
     /// Returns true if audio capture is currently running.
+    #[allow(dead_code)]
     fn is_running(&self) -> bool;
 
     /// Poll for the next available audio buffer. Returns None if no new data is ready.

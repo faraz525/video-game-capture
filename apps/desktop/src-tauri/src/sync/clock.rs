@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Instant;
 
 /// Microsecond-resolution timestamp relative to session start.
@@ -8,14 +9,18 @@ pub type TimestampUs = u64;
 /// All timestamps are relative to when the clock was created, expressed
 /// in microseconds. This ensures monotonic, comparable timestamps across
 /// video, input, and audio streams.
+///
+/// Cloning a `SyncClock` shares the same epoch, so all clones produce
+/// timestamps relative to the same origin.
+#[derive(Clone)]
 pub struct SyncClock {
-    epoch: Instant,
+    epoch: Arc<Instant>,
 }
 
 impl SyncClock {
     pub fn new() -> Self {
         Self {
-            epoch: Instant::now(),
+            epoch: Arc::new(Instant::now()),
         }
     }
 
@@ -55,6 +60,19 @@ mod tests {
         let clock = SyncClock::new();
         let t = clock.now_us();
         assert!(t < 1_000_000, "first timestamp should be <1s, got {t}us");
+    }
+
+    #[test]
+    fn clones_share_epoch() {
+        let clock1 = SyncClock::new();
+        let clock2 = clock1.clone();
+
+        let t1 = clock1.now_us();
+        let t2 = clock2.now_us();
+
+        // Both clones should report similar timestamps (within 1ms)
+        let diff = if t2 > t1 { t2 - t1 } else { t1 - t2 };
+        assert!(diff < 1_000, "clones should share epoch, diff={diff}us");
     }
 
     #[test]

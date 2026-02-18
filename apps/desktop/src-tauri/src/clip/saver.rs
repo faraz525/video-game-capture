@@ -69,13 +69,35 @@ impl ClipSaver {
         self.audio_buffers.push(buffer);
     }
 
+    /// Returns the save directory path.
+    pub fn save_dir(&self) -> &std::path::Path {
+        &self.save_dir
+    }
+
     /// Save the current ring buffer contents as a .gameclip file.
     /// Returns the path to the saved clip.
+    #[allow(dead_code)]
     pub fn save_clip(&mut self, game_name: Option<String>) -> Result<PathBuf, SaveError> {
         let frames = self.frames.drain();
         let input_events = self.input_events.drain();
         let audio_buffers = self.audio_buffers.drain();
+        let save_dir = self.save_dir.clone();
 
+        Self::save_clip_from_data(frames, input_events, audio_buffers, game_name, &save_dir)
+    }
+
+    /// Package pre-drained data into a .gameclip file.
+    ///
+    /// This static method performs all heavy work (thumbnail, encoding, zip)
+    /// without holding the saver mutex, minimizing lock contention with the
+    /// capture thread.
+    pub fn save_clip_from_data(
+        frames: Vec<CapturedFrame>,
+        input_events: Vec<InputEvent>,
+        audio_buffers: Vec<AudioBuffer>,
+        game_name: Option<String>,
+        save_dir: &std::path::Path,
+    ) -> Result<PathBuf, SaveError> {
         if frames.is_empty() {
             return Err(SaveError::NoFrames);
         }
@@ -131,8 +153,7 @@ impl ClipSaver {
             },
         };
 
-        // Concatenate raw frame data as video (real impl would encode to H.264)
-        let video_data: Vec<u8> = frames.iter().flat_map(|f| f.data.iter().copied()).collect();
+        let video_data = encode_video(&frames, metadata.fps);
 
         // Concatenate audio buffers as raw PCM bytes
         let audio_data: Vec<u8> = audio_buffers
@@ -144,7 +165,6 @@ impl ClipSaver {
             })
             .collect();
 
-        // Generate thumbnail from first frame (raw RGBA for now)
         let thumbnail = generate_thumbnail(first_frame);
 
         let package = ClipPackageData {
@@ -156,9 +176,9 @@ impl ClipSaver {
         };
 
         let filename = format!("{clip_name}.gameclip");
-        let clip_path = self.save_dir.join(filename);
+        let clip_path = save_dir.join(filename);
 
-        std::fs::create_dir_all(&self.save_dir)
+        std::fs::create_dir_all(save_dir)
             .map_err(|e| SaveError::Format(super::format::ClipFormatError::Io(e)))?;
 
         write_clip(&clip_path, &package)?;
@@ -166,21 +186,81 @@ impl ClipSaver {
     }
 }
 
-/// Generate a simple thumbnail from a captured frame.
-/// For mock data, creates a tiny PNG. Real impl would use the image crate
-/// to properly resize and encode as JPEG.
+/// Encode video frames. On Windows with FFmpeg available, produces MP4.
+/// On Mac/Linux or if FFmpeg is not found, falls back to raw RGBA concatenation.
+fn encode_video(frames: &[CapturedFrame], fps: u32) -> Vec<u8> {
+    #[cfg(target_os = "windows")]
+    {
+        match super::encoder::encode_frames_to_mp4(frames, fps) {
+            Ok(mp4_data) => return mp4_data,
+            Err(e) => {
+                eprintln!("[GameClip] FFmpeg encoding failed, falling back to raw: {e}");
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    let _ = fps;
+
+    // Fallback: raw RGBA concatenation
+    frames.iter().flat_map(|f| f.data.iter().copied()).collect()
+}
+
+const THUMBNAIL_WIDTH: u32 = 320;
+const THUMBNAIL_JPEG_QUALITY: u8 = 80;
+
+/// Generate a JPEG thumbnail from a captured frame.
+///
+/// Resizes the frame to `THUMBNAIL_WIDTH` pixels wide (maintaining aspect ratio)
+/// and encodes as JPEG.
 fn generate_thumbnail(frame: &CapturedFrame) -> Vec<u8> {
-    // For now, just store the first few KB of raw pixel data as a placeholder.
-    // A real implementation would downscale and encode to JPEG.
-    let max_bytes = 4096;
-    let take = frame.data.len().min(max_bytes);
-    frame.data[..take].to_vec()
+    use image::{ImageBuffer, RgbaImage};
+    use std::io::Cursor;
+
+    let img: Option<RgbaImage> =
+        ImageBuffer::from_raw(frame.width, frame.height, frame.data.clone());
+
+    let Some(img) = img else {
+        return Vec::new();
+    };
+
+    let aspect = frame.height as f64 / frame.width as f64;
+    let thumb_height = (THUMBNAIL_WIDTH as f64 * aspect).round() as u32;
+
+    let resized = image::imageops::resize(
+        &img,
+        THUMBNAIL_WIDTH,
+        thumb_height,
+        image::imageops::FilterType::Triangle,
+    );
+
+    let rgb_img = image::DynamicImage::ImageRgba8(
+        image::ImageBuffer::from_raw(THUMBNAIL_WIDTH, thumb_height, resized.into_raw())
+            .unwrap_or_else(|| ImageBuffer::new(THUMBNAIL_WIDTH, thumb_height)),
+    )
+    .to_rgb8();
+
+    let mut buf = Cursor::new(Vec::new());
+    let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, THUMBNAIL_JPEG_QUALITY);
+    if image::ImageEncoder::write_image(
+        encoder,
+        &rgb_img,
+        THUMBNAIL_WIDTH,
+        thumb_height,
+        image::ExtendedColorType::Rgb8,
+    )
+    .is_err()
+    {
+        return Vec::new();
+    }
+
+    buf.into_inner()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capture::{CaptureConfig, CapturedFrame};
+    use crate::capture::CapturedFrame;
     use crate::clip::format::read_clip;
     use crate::input::{InputEventKind, KeyEvent, MouseMoveEvent};
     use tempfile::TempDir;
@@ -299,6 +379,20 @@ mod tests {
         assert!(contents.metadata.devices.keyboard);
         assert!(contents.metadata.devices.mouse);
         assert!(!contents.metadata.devices.controller);
+    }
+
+    #[test]
+    fn thumbnail_is_valid_jpeg() {
+        let frame = make_frame(0);
+        let thumbnail = generate_thumbnail(&frame);
+
+        // JPEG files start with FF D8 FF
+        assert!(thumbnail.len() > 3, "thumbnail should not be empty");
+        assert_eq!(
+            &thumbnail[0..2],
+            &[0xFF, 0xD8],
+            "thumbnail should be valid JPEG"
+        );
     }
 
     #[test]

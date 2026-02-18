@@ -39,7 +39,7 @@ impl MockInputRecorder {
                 let key_idx = (counter / 2) as usize % MOCK_KEYS.len();
                 InputEventKind::Key(KeyEvent {
                     key: MOCK_KEYS[key_idx].to_string(),
-                    pressed: counter % 2 == 0,
+                    pressed: counter.is_multiple_of(2),
                 })
             }
             2 => InputEventKind::MouseMove(MouseMoveEvent {

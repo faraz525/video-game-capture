@@ -43,21 +43,25 @@ impl<T: Timestamped> RingBuffer<T> {
     }
 
     /// Returns the number of items currently in the buffer.
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.items.len()
     }
 
     /// Returns true if the buffer is empty.
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
 
     /// Returns a reference to all items in the buffer.
+    #[allow(dead_code)]
     pub fn items(&self) -> &VecDeque<T> {
         &self.items
     }
 
     /// Clear all items from the buffer.
+    #[allow(dead_code)]
     pub fn clear(&mut self) {
         self.items.clear();
     }

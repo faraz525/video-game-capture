@@ -43,7 +43,7 @@ pub fn run() {
                 })
                 .build(app)?;
 
-            // Start the mock capture engine
+            // Start the capture engine
             {
                 let state = app.state::<engine::EngineState>();
                 engine::start_capture(&state)?;

@@ -78,6 +78,7 @@ pub enum InputError {
     #[error("recorder already running")]
     AlreadyRunning,
     #[error("platform error: {0}")]
+    #[allow(dead_code)]
     Platform(String),
 }
 
@@ -94,6 +95,7 @@ pub trait InputRecorder: Send {
     fn stop(&mut self) -> Result<(), InputError>;
 
     /// Returns true if the recorder is currently running.
+    #[allow(dead_code)]
     fn is_running(&self) -> bool;
 
     /// Drain all buffered input events since the last poll.

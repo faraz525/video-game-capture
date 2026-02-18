@@ -46,12 +46,12 @@ pub fn write_clip(path: &Path, data: &ClipPackageData) -> Result<(), ClipFormatE
         .compression_method(zip::CompressionMethod::Deflated);
 
     // metadata.json
-    zip.start_file("metadata.json", options.clone())?;
+    zip.start_file("metadata.json", options)?;
     let metadata_json = serde_json::to_string_pretty(&data.metadata)?;
     zip.write_all(metadata_json.as_bytes())?;
 
     // input.jsonl
-    zip.start_file("input.jsonl", options.clone())?;
+    zip.start_file("input.jsonl", options)?;
     for event in &data.input_events {
         let line = serde_json::to_string(event)?;
         zip.write_all(line.as_bytes())?;
@@ -59,12 +59,12 @@ pub fn write_clip(path: &Path, data: &ClipPackageData) -> Result<(), ClipFormatE
     }
 
     // video.bin
-    zip.start_file("video.bin", options.clone())?;
+    zip.start_file("video.bin", options)?;
     zip.write_all(&data.video_data)?;
 
     // audio.bin (only if we have audio data)
     if !data.audio_data.is_empty() {
-        zip.start_file("audio.bin", options.clone())?;
+        zip.start_file("audio.bin", options)?;
         zip.write_all(&data.audio_data)?;
     }
 
@@ -79,6 +79,7 @@ pub fn write_clip(path: &Path, data: &ClipPackageData) -> Result<(), ClipFormatE
 }
 
 /// Contents read back from a .gameclip file.
+#[allow(dead_code)]
 pub struct ClipPackageContents {
     pub metadata: ClipMetadata,
     pub input_events: Vec<InputEvent>,
@@ -111,7 +112,7 @@ pub fn read_clip(path: &Path) -> Result<ClipPackageContents, ClipFormatError> {
         entry.read_to_string(&mut buf)?;
         buf.lines()
             .filter(|line| !line.is_empty())
-            .map(|line| serde_json::from_str(line))
+            .map(serde_json::from_str)
             .collect::<Result<Vec<_>, _>>()?
     };
 

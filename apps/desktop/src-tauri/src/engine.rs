@@ -1,13 +1,12 @@
-use crate::audio::mock::MockAudioCapture;
-use crate::audio::{AudioCapture, AudioConfig};
-use crate::capture::mock::MockCapture;
+use crate::audio::AudioCapture;
+use crate::audio::AudioConfig;
 use crate::capture::{CaptureConfig, ScreenCapture};
 use crate::clip::saver::ClipSaver;
-use crate::input::mock::MockInputRecorder;
 use crate::input::InputRecorder;
 use crate::sync::clock::SyncClock;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -16,8 +15,8 @@ const POLL_INTERVAL_MS: u64 = 5;
 
 /// Application-wide capture engine state, shared across threads.
 pub struct EngineState {
-    pub saver: Mutex<ClipSaver>,
-    pub running: Mutex<bool>,
+    pub saver: Arc<Mutex<ClipSaver>>,
+    pub running: Arc<AtomicBool>,
     pub settings: Mutex<AppSettings>,
 }
 
@@ -54,6 +53,39 @@ fn dirs_default_clips_dir() -> String {
     path.to_string_lossy().to_string()
 }
 
+/// Create the platform-appropriate screen capture implementation.
+#[cfg(target_os = "windows")]
+fn create_screen_capture(clock: SyncClock) -> Box<dyn ScreenCapture> {
+    Box::new(crate::capture::windows::WindowsCapture::new(clock))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn create_screen_capture(clock: SyncClock) -> Box<dyn ScreenCapture> {
+    Box::new(crate::capture::mock::MockCapture::new(clock))
+}
+
+/// Create the platform-appropriate input recorder implementation.
+#[cfg(target_os = "windows")]
+fn create_input_recorder(clock: SyncClock) -> Box<dyn InputRecorder> {
+    Box::new(crate::input::windows::WindowsInputRecorder::new(clock))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn create_input_recorder(clock: SyncClock) -> Box<dyn InputRecorder> {
+    Box::new(crate::input::mock::MockInputRecorder::new(clock))
+}
+
+/// Create the platform-appropriate audio capture implementation.
+#[cfg(target_os = "windows")]
+fn create_audio_capture(clock: SyncClock) -> Box<dyn AudioCapture> {
+    Box::new(crate::audio::windows::WindowsAudioCapture::new(clock))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn create_audio_capture(clock: SyncClock) -> Box<dyn AudioCapture> {
+    Box::new(crate::audio::mock::MockAudioCapture::new(clock))
+}
+
 pub fn create_engine_state() -> EngineState {
     let settings = AppSettings::default();
     let saver = ClipSaver::new(
@@ -62,172 +94,120 @@ pub fn create_engine_state() -> EngineState {
     );
 
     EngineState {
-        saver: Mutex::new(saver),
-        running: Mutex::new(false),
+        saver: Arc::new(Mutex::new(saver)),
+        running: Arc::new(AtomicBool::new(false)),
         settings: Mutex::new(settings),
     }
 }
 
-/// Start the background capture loop using mock implementations.
+/// Start the background capture loop using platform-appropriate implementations.
+///
+/// The capture thread pushes data directly into the shared `ClipSaver` ring buffers,
+/// so `save_clip()` simply drains whatever is buffered.
 pub fn start_capture(state: &EngineState) -> Result<(), Box<dyn std::error::Error>> {
-    let mut running = state.running.lock().map_err(|e| e.to_string())?;
-    if *running {
+    if state.running.load(Ordering::SeqCst) {
         return Ok(());
     }
-    *running = true;
-    drop(running);
+    state.running.store(true, Ordering::SeqCst);
 
-    // We need a way for the background thread to push data to the saver.
-    // Since EngineState is behind Tauri's state management, we can't move it.
-    // Instead, we'll use a channel to send captured data back.
-    let (frame_tx, frame_rx) = std::sync::mpsc::channel();
-    let (input_tx, input_rx) = std::sync::mpsc::channel();
-    let (audio_tx, audio_rx) = std::sync::mpsc::channel();
+    let settings = state.settings.lock().map_err(|e| e.to_string())?.clone();
+    let saver = Arc::clone(&state.saver);
+    let running = Arc::clone(&state.running);
 
-    // Capture thread
     thread::spawn(move || {
         let clock = SyncClock::new();
-        let mut screen = MockCapture::new(SyncClock::new());
-        let mut input = MockInputRecorder::new(SyncClock::new());
-        let mut audio_cap = MockAudioCapture::new(SyncClock::new());
+        let mut screen = create_screen_capture(clock.clone());
+        let mut input = create_input_recorder(clock.clone());
+        let mut audio = create_audio_capture(clock.clone());
 
         let config = CaptureConfig {
-            target_fps: 60,
-            width: 320,  // Small for mock
-            height: 240,
+            target_fps: settings.capture_fps,
+            width: settings.capture_width,
+            height: settings.capture_height,
         };
         let audio_config = AudioConfig::default();
 
         if let Err(e) = screen.start(config) {
             eprintln!("[GameClip] Failed to start capture: {e}");
+            running.store(false, Ordering::SeqCst);
             return;
         }
         if let Err(e) = input.start() {
             eprintln!("[GameClip] Failed to start input recorder: {e}");
+            running.store(false, Ordering::SeqCst);
             return;
         }
-        if let Err(e) = audio_cap.start(audio_config) {
+        if let Err(e) = audio.start(audio_config) {
             eprintln!("[GameClip] Failed to start audio capture: {e}");
+            running.store(false, Ordering::SeqCst);
             return;
         }
 
-        // Use a separate clock reference (not used in this loop since mocks have their own)
-        let _ = clock;
-
-        loop {
+        while running.load(Ordering::Relaxed) {
             if let Ok(Some(frame)) = screen.poll_frame() {
-                if frame_tx.send(frame).is_err() {
-                    break;
-                }
+                let mut s = lock_or_recover(&saver);
+                s.push_frame(frame);
             }
 
             if let Ok(events) = input.poll_events() {
-                for event in events {
-                    if input_tx.send(event).is_err() {
-                        return;
+                if !events.is_empty() {
+                    let mut s = lock_or_recover(&saver);
+                    for event in events {
+                        s.push_input(event);
                     }
                 }
             }
 
-            if let Ok(Some(buffer)) = audio_cap.poll_buffer() {
-                if audio_tx.send(buffer).is_err() {
-                    break;
-                }
+            if let Ok(Some(buffer)) = audio.poll_buffer() {
+                let mut s = lock_or_recover(&saver);
+                s.push_audio(buffer);
             }
 
             thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
         }
-    });
 
-    // Consumer thread that pushes into the ring buffer
-    // We need a reference to the saver, but it's inside EngineState.
-    // Use a separate thread that reads from channels and pushes to saver
-    // via a shared pointer pattern. Since EngineState is managed by Tauri,
-    // we'll use a helper approach: periodically drain channels from main loop.
-    // Actually, let's use a simpler approach — spin a thread that holds
-    // references via leaked pointer (safe for app-lifetime state).
-
-    // For now, store the receivers in the state so the save_clip function
-    // can drain them. This is a pragmatic approach for the MVP.
-    // The channels will be drained on each save_clip call or periodically.
-
-    // Drain thread
-    thread::spawn({
-        // We need to get a reference to the saver. Since EngineState lives
-        // for the app lifetime, we can safely reference it via a leaked Arc.
-        // However, for simplicity in this MVP, we'll use a background drain loop.
-        move || {
-            loop {
-                // Drain channels and discard — the saver will be fed separately.
-                // Actually, we need to feed the saver. The issue is the saver is
-                // behind a Mutex in EngineState which lives in Tauri state.
-                //
-                // The cleanest approach: feed frames directly into the saver from
-                // this thread. But we need access to the EngineState.
-                //
-                // For the MVP, we'll buffer in channels and drain on save.
-                // This means the ring buffer won't evict until save is called.
-                // This is acceptable for now.
-                thread::sleep(Duration::from_millis(100));
-
-                // Drain to prevent channel from growing unbounded
-                while frame_rx.try_recv().is_ok() {}
-                while input_rx.try_recv().is_ok() {}
-                while audio_rx.try_recv().is_ok() {}
-            }
-        }
+        // Clean shutdown
+        let _ = screen.stop();
+        let _ = input.stop();
+        let _ = audio.stop();
     });
 
     Ok(())
 }
 
+/// Lock the saver mutex, recovering from poison if necessary.
+fn lock_or_recover(saver: &Arc<Mutex<ClipSaver>>) -> std::sync::MutexGuard<'_, ClipSaver> {
+    saver.lock().unwrap_or_else(|poisoned| {
+        eprintln!("[GameClip] Saver mutex poisoned, recovering");
+        poisoned.into_inner()
+    })
+}
+
 /// Save a clip from the current ring buffer contents.
 ///
-/// For the MVP, this generates fresh mock data since the background thread
-/// drains channels. In production, the ring buffer approach would be wired up
-/// with proper shared state.
+/// Drains the ring buffers quickly (minimizing lock contention with the capture
+/// thread), then performs the heavy work (thumbnail generation, encoding, zip
+/// packaging) outside the lock.
 pub fn save_clip(state: &EngineState) -> Result<PathBuf, String> {
-    let mut saver = state.saver.lock().map_err(|e| e.to_string())?;
-
-    // Generate mock data for the clip since the background capture doesn't
-    // feed into the saver directly in this MVP architecture.
-    // In production, the capture thread would push directly into the ring buffers.
-    let clock = SyncClock::new();
-    let config = CaptureConfig {
-        target_fps: 60,
-        width: 320,
-        height: 240,
+    let (frames, input_events, audio_buffers, save_dir) = {
+        let mut saver = lock_or_recover(&state.saver);
+        let frames = saver.frames.drain();
+        let input_events = saver.input_events.drain();
+        let audio_buffers = saver.audio_buffers.drain();
+        let save_dir = saver.save_dir().to_path_buf();
+        (frames, input_events, audio_buffers, save_dir)
     };
+    // Lock released here — capture thread resumes immediately
 
-    let mut mock_capture = MockCapture::new(SyncClock::new());
-    let mut mock_input = MockInputRecorder::new(SyncClock::new());
-    let mut mock_audio = MockAudioCapture::new(SyncClock::new());
+    let game_name = detect_current_game();
+    ClipSaver::save_clip_from_data(frames, input_events, audio_buffers, game_name, &save_dir)
+        .map_err(|e| e.to_string())
+}
 
-    mock_capture
-        .start(config)
-        .map_err(|e| e.to_string())?;
-    mock_input.start().map_err(|e| e.to_string())?;
-    mock_audio
-        .start(AudioConfig::default())
-        .map_err(|e| e.to_string())?;
-
-    let _ = clock;
-
-    // Generate a few seconds of mock data
-    for _ in 0..60 {
-        if let Ok(Some(frame)) = mock_capture.poll_frame() {
-            saver.push_frame(frame);
-        }
-        if let Ok(events) = mock_input.poll_events() {
-            for event in events {
-                saver.push_input(event);
-            }
-        }
-        if let Ok(Some(buffer)) = mock_audio.poll_buffer() {
-            saver.push_audio(buffer);
-        }
-        thread::sleep(Duration::from_millis(1));
-    }
-
-    saver.save_clip(None).map_err(|e| e.to_string())
+/// Detect the currently running game (if any).
+///
+/// Uses foreground window detection on Windows, falls back to process scan
+/// on all platforms.
+fn detect_current_game() -> Option<String> {
+    crate::game::detector::detect_current_game()
 }

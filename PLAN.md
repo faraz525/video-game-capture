@@ -317,9 +317,9 @@ The g4dn.xlarge provides an NVIDIA T4 GPU for testing the capture engine with re
 | 2. Platform Abstraction | ✅ Complete | 28 tests |
 | 3. Ring Buffer + Clip Save | ✅ Complete | 23 tests |
 | 4. Clip Library UI | ✅ Complete | TS clean |
-| 5. Windows Capture Engine | Not started | — |
+| 5. Windows Capture Engine | 🔧 Code written (untested on Windows) | 6 tests |
 | 6. Backend API | Not started | — |
 | 7. Bounty Marketplace | Not started | — |
 | 8. Web Clip Viewer | Not started | — |
 
-**Total: 51 passing Rust tests, 0 failures.**
+**Total: 57 passing Rust tests, 0 failures. Clippy clean.**
