@@ -1,3 +1,4 @@
+import { useThumbnail } from "../hooks/useThumbnail";
 import type { ClipSummary } from "../hooks/useClips";
 
 interface ClipCardProps {
@@ -23,12 +24,29 @@ function formatDate(iso: string): string {
 }
 
 export function ClipCard({ clip, onSelect, onDelete }: ClipCardProps) {
+  const thumbnail = useThumbnail(clip.file_path);
+
   return (
     <div className="clip-card" onClick={() => onSelect(clip)}>
       <div className="clip-thumbnail">
-        <div className="clip-thumbnail-placeholder">
-          <span className="clip-duration">{formatDuration(clip.duration_secs)}</span>
-        </div>
+        {thumbnail ? (
+          <>
+            <img
+              className="clip-thumbnail-img"
+              src={thumbnail}
+              alt={clip.name}
+            />
+            <span className="clip-duration">
+              {formatDuration(clip.duration_secs)}
+            </span>
+          </>
+        ) : (
+          <div className="clip-thumbnail-placeholder">
+            <span className="clip-duration">
+              {formatDuration(clip.duration_secs)}
+            </span>
+          </div>
+        )}
       </div>
       <div className="clip-info">
         <div className="clip-name">{clip.name}</div>

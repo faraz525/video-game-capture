@@ -17,6 +17,8 @@ interface InputOverlayProps {
   currentTimeUs: number;
   width: number;
   height: number;
+  captureWidth?: number;
+  captureHeight?: number;
 }
 
 const VISIBLE_WINDOW_US = 500_000; // Show events within 500ms of current time
@@ -27,6 +29,8 @@ export function InputOverlay({
   currentTimeUs,
   width,
   height,
+  captureWidth = 1920,
+  captureHeight = 1080,
 }: InputOverlayProps) {
   const visibleEvents = useMemo(() => {
     return events.filter(
@@ -61,10 +65,10 @@ export function InputOverlay({
     if (moves.length === 0) return null;
     const latest = moves[moves.length - 1];
     return {
-      x: (latest.x! / 1920) * width,
-      y: (latest.y! / 1080) * height,
+      x: (latest.x! / captureWidth) * width,
+      y: (latest.y! / captureHeight) * height,
     };
-  }, [visibleEvents, width, height]);
+  }, [visibleEvents, width, height, captureWidth, captureHeight]);
 
   const mouseClicks = useMemo(() => {
     return visibleEvents
@@ -75,11 +79,11 @@ export function InputOverlay({
           currentTimeUs - e.timestamp_us < KEY_DISPLAY_DURATION_US,
       )
       .map((e) => ({
-        x: ((e.x ?? 0) / 1920) * width,
-        y: ((e.y ?? 0) / 1080) * height,
+        x: ((e.x ?? 0) / captureWidth) * width,
+        y: ((e.y ?? 0) / captureHeight) * height,
         button: e.button ?? "left",
       }));
-  }, [visibleEvents, currentTimeUs, width, height]);
+  }, [visibleEvents, currentTimeUs, width, height, captureWidth, captureHeight]);
 
   return (
     <div className="input-overlay" style={{ width, height }}>

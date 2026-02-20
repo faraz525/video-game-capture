@@ -1,8 +1,11 @@
 use crate::clip::format::read_clip;
 use crate::clip::metadata::ClipMetadata;
 use crate::engine::{AppSettings, EngineState};
+use crate::input::InputEvent;
+use base64::Engine as _;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tauri::State;
 
 /// Serializable clip summary for the frontend.
@@ -83,10 +86,18 @@ pub fn delete_clip(file_path: String) -> Result<(), String> {
 }
 
 /// Trigger a clip save from the frontend.
+///
+/// Runs the heavy encoding/packaging work on a blocking thread so the
+/// Tauri main thread (and therefore the UI) stays responsive.
 #[tauri::command]
-pub fn save_clip(state: State<'_, EngineState>) -> Result<String, String> {
-    let path = crate::engine::save_clip(&state)?;
-    Ok(path.to_string_lossy().to_string())
+pub async fn save_clip(state: State<'_, EngineState>) -> Result<String, String> {
+    let saver = Arc::clone(&state.saver);
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::engine::save_clip(&saver)
+            .map(|p| p.to_string_lossy().to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Get current app settings.
@@ -105,4 +116,44 @@ pub fn update_settings(
     let mut settings = state.settings.lock().map_err(|e| e.to_string())?;
     *settings = new_settings;
     Ok(())
+}
+
+/// Extract video data from a .gameclip file and write to a temp MP4 file.
+/// Returns the temp file path for use with convertFileSrc().
+#[tauri::command]
+pub fn extract_clip_video(file_path: String) -> Result<String, String> {
+    let path = PathBuf::from(&file_path);
+    let contents = read_clip(&path).map_err(|e| e.to_string())?;
+
+    let playback_dir = std::env::temp_dir().join("gameclip_playback");
+    fs::create_dir_all(&playback_dir).map_err(|e| e.to_string())?;
+
+    let out_path = playback_dir.join(format!("{}.mp4", contents.metadata.id));
+
+    fs::write(&out_path, &contents.video_data).map_err(|e| e.to_string())?;
+
+    Ok(out_path.to_string_lossy().to_string())
+}
+
+/// Get thumbnail from a .gameclip file as a base64 data URL.
+/// Returns None if the clip has no thumbnail.
+#[tauri::command]
+pub fn get_clip_thumbnail(file_path: String) -> Result<Option<String>, String> {
+    let path = PathBuf::from(&file_path);
+    let contents = read_clip(&path).map_err(|e| e.to_string())?;
+
+    if contents.thumbnail.is_empty() {
+        return Ok(None);
+    }
+
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&contents.thumbnail);
+    Ok(Some(format!("data:image/jpeg;base64,{b64}")))
+}
+
+/// Get input events from a .gameclip file.
+#[tauri::command]
+pub fn get_clip_input_events(file_path: String) -> Result<Vec<InputEvent>, String> {
+    let path = PathBuf::from(&file_path);
+    let contents = read_clip(&path).map_err(|e| e.to_string())?;
+    Ok(contents.input_events)
 }

@@ -188,13 +188,16 @@ fn lock_or_recover(saver: &Arc<Mutex<ClipSaver>>) -> std::sync::MutexGuard<'_, C
 /// Drains the ring buffers quickly (minimizing lock contention with the capture
 /// thread), then performs the heavy work (thumbnail generation, encoding, zip
 /// packaging) outside the lock.
-pub fn save_clip(state: &EngineState) -> Result<PathBuf, String> {
+///
+/// Takes an `Arc<Mutex<ClipSaver>>` directly so callers can clone it and
+/// spawn this on a background thread without holding a reference to EngineState.
+pub fn save_clip(saver: &Arc<Mutex<ClipSaver>>) -> Result<PathBuf, String> {
     let (frames, input_events, audio_buffers, save_dir) = {
-        let mut saver = lock_or_recover(&state.saver);
-        let frames = saver.frames.drain();
-        let input_events = saver.input_events.drain();
-        let audio_buffers = saver.audio_buffers.drain();
-        let save_dir = saver.save_dir().to_path_buf();
+        let mut s = lock_or_recover(saver);
+        let frames = s.frames.drain();
+        let input_events = s.input_events.drain();
+        let audio_buffers = s.audio_buffers.drain();
+        let save_dir = s.save_dir().to_path_buf();
         (frames, input_events, audio_buffers, save_dir)
     };
     // Lock released here — capture thread resumes immediately

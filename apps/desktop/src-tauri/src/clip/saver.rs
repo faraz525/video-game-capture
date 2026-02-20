@@ -186,21 +186,15 @@ impl ClipSaver {
     }
 }
 
-/// Encode video frames. On Windows with FFmpeg available, produces MP4.
-/// On Mac/Linux or if FFmpeg is not found, falls back to raw RGBA concatenation.
+/// Encode video frames. Tries FFmpeg (produces MP4) first on all platforms,
+/// falls back to raw RGBA concatenation if FFmpeg is unavailable.
 fn encode_video(frames: &[CapturedFrame], fps: u32) -> Vec<u8> {
-    #[cfg(target_os = "windows")]
-    {
-        match super::encoder::encode_frames_to_mp4(frames, fps) {
-            Ok(mp4_data) => return mp4_data,
-            Err(e) => {
-                eprintln!("[GameClip] FFmpeg encoding failed, falling back to raw: {e}");
-            }
+    match super::encoder::encode_frames_to_mp4(frames, fps) {
+        Ok(mp4_data) => return mp4_data,
+        Err(e) => {
+            eprintln!("[GameClip] FFmpeg encoding failed, falling back to raw: {e}");
         }
     }
-
-    #[cfg(not(target_os = "windows"))]
-    let _ = fps;
 
     // Fallback: raw RGBA concatenation
     frames.iter().flat_map(|f| f.data.iter().copied()).collect()

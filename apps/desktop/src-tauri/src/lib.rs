@@ -8,6 +8,7 @@ mod sync;
 mod commands;
 mod engine;
 
+use std::sync::Arc;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
@@ -66,22 +67,26 @@ pub fn run() {
                                 && event.state() == ShortcutState::Pressed
                             {
                                 let state = app_handle.state::<engine::EngineState>();
-                                match engine::save_clip(&state) {
-                                    Ok(path) => {
-                                        println!(
-                                            "[GameClip] Clip saved: {}",
-                                            path.display()
-                                        );
-                                        if let Some(window) =
-                                            app_handle.get_webview_window("main")
-                                        {
-                                            let _ = window.emit("clip-saved", path.to_string_lossy().to_string());
+                                let saver = Arc::clone(&state.saver);
+                                let handle = app_handle.clone();
+                                std::thread::spawn(move || {
+                                    match engine::save_clip(&saver) {
+                                        Ok(path) => {
+                                            println!(
+                                                "[GameClip] Clip saved: {}",
+                                                path.display()
+                                            );
+                                            if let Some(window) =
+                                                handle.get_webview_window("main")
+                                            {
+                                                let _ = window.emit("clip-saved", path.to_string_lossy().to_string());
+                                            }
+                                        }
+                                        Err(e) => {
+                                            eprintln!("[GameClip] Failed to save clip: {e}");
                                         }
                                     }
-                                    Err(e) => {
-                                        eprintln!("[GameClip] Failed to save clip: {e}");
-                                    }
-                                }
+                                });
                             }
                         })
                         .build(),
@@ -99,6 +104,9 @@ pub fn run() {
             commands::save_clip,
             commands::get_settings,
             commands::update_settings,
+            commands::extract_clip_video,
+            commands::get_clip_thumbnail,
+            commands::get_clip_input_events,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

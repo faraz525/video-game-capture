@@ -1,16 +1,7 @@
 import { useState, useCallback, useEffect, useRef } from "react";
 import { InputOverlay } from "../components/InputOverlay";
+import { useClipData } from "../hooks/useClipData";
 import type { ClipSummary } from "../hooks/useClips";
-
-interface InputEvent {
-  timestamp_us: number;
-  type: string;
-  key?: string;
-  pressed?: boolean;
-  button?: string;
-  x?: number;
-  y?: number;
-}
 
 interface ClipPlayerProps {
   clip: ClipSummary;
@@ -18,24 +9,44 @@ interface ClipPlayerProps {
 }
 
 export function ClipPlayer({ clip, onBack }: ClipPlayerProps) {
+  const { videoUrl, inputEvents, loading, error, loadClipData } =
+    useClipData();
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const animationRef = useRef<number | null>(null);
   const [playing, setPlaying] = useState(false);
   const [currentTimeUs, setCurrentTimeUs] = useState(0);
-  const [inputEvents] = useState<InputEvent[]>(() => generateMockInputEvents(clip));
-  const animationRef = useRef<number | null>(null);
-  const startTimeRef = useRef<number | null>(null);
-  const playerRef = useRef<HTMLDivElement>(null);
+  const [durationUs, setDurationUs] = useState(clip.duration_secs * 1_000_000);
 
-  const durationUs = clip.duration_secs * 1_000_000;
+  useEffect(() => {
+    loadClipData(clip.file_path);
+  }, [clip.file_path, loadClipData]);
+
+  const syncOverlay = useCallback(() => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    const timeUs = video.currentTime * 1_000_000;
+    setCurrentTimeUs(timeUs);
+
+    if (!video.paused && !video.ended) {
+      animationRef.current = requestAnimationFrame(syncOverlay);
+    }
+  }, []);
 
   const play = useCallback(() => {
-    if (currentTimeUs >= durationUs) {
-      setCurrentTimeUs(0);
-    }
+    const video = videoRef.current;
+    if (!video) return;
+    video.play().catch(() => {
+      setPlaying(false);
+    });
     setPlaying(true);
-    startTimeRef.current = performance.now() - (currentTimeUs / 1000);
-  }, [currentTimeUs, durationUs]);
+    animationRef.current = requestAnimationFrame(syncOverlay);
+  }, [syncOverlay]);
 
   const pause = useCallback(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    video.pause();
     setPlaying(false);
     if (animationRef.current !== null) {
       cancelAnimationFrame(animationRef.current);
@@ -45,42 +56,57 @@ export function ClipPlayer({ clip, onBack }: ClipPlayerProps) {
 
   const seek = useCallback(
     (fraction: number) => {
-      const newTime = fraction * durationUs;
-      setCurrentTimeUs(newTime);
-      if (playing) {
-        startTimeRef.current = performance.now() - (newTime / 1000);
-      }
+      const video = videoRef.current;
+      if (!video) return;
+      const newTimeSec = fraction * (durationUs / 1_000_000);
+      video.currentTime = newTimeSec;
+      setCurrentTimeUs(fraction * durationUs);
     },
-    [durationUs, playing],
+    [durationUs],
   );
 
+  const handleVideoPlay = useCallback(() => {
+    setPlaying(true);
+    animationRef.current = requestAnimationFrame(syncOverlay);
+  }, [syncOverlay]);
+
+  const handleVideoPause = useCallback(() => {
+    setPlaying(false);
+    if (animationRef.current !== null) {
+      cancelAnimationFrame(animationRef.current);
+      animationRef.current = null;
+    }
+  }, []);
+
+  const handleVideoEnded = useCallback(() => {
+    setPlaying(false);
+    if (animationRef.current !== null) {
+      cancelAnimationFrame(animationRef.current);
+      animationRef.current = null;
+    }
+  }, []);
+
+  const handleLoadedMetadata = useCallback(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    if (video.duration && isFinite(video.duration)) {
+      setDurationUs(video.duration * 1_000_000);
+    }
+  }, []);
+
   useEffect(() => {
-    if (!playing) return;
-
-    const tick = () => {
-      if (!startTimeRef.current) return;
-      const elapsed = (performance.now() - startTimeRef.current) * 1000; // ms to us
-      if (elapsed >= durationUs) {
-        setCurrentTimeUs(durationUs);
-        setPlaying(false);
-        return;
-      }
-      setCurrentTimeUs(elapsed);
-      animationRef.current = requestAnimationFrame(tick);
-    };
-
-    animationRef.current = requestAnimationFrame(tick);
-
     return () => {
       if (animationRef.current !== null) {
         cancelAnimationFrame(animationRef.current);
       }
     };
-  }, [playing, durationUs]);
+  }, []);
 
   const progress = durationUs > 0 ? currentTimeUs / durationUs : 0;
   const playerWidth = 640;
-  const playerHeight = 480;
+  const playerHeight = Math.round(
+    playerWidth * (clip.height / clip.width),
+  );
 
   return (
     <div className="clip-player">
@@ -99,36 +125,56 @@ export function ClipPlayer({ clip, onBack }: ClipPlayerProps) {
         </div>
       </div>
 
-      <div className="player-viewport" ref={playerRef}>
+      <div className="player-viewport">
         <div
           className="player-canvas"
           style={{ width: playerWidth, height: playerHeight }}
         >
-          {/* Mock video: cycling background color */}
-          <div
-            className="mock-video"
-            style={{
-              width: playerWidth,
-              height: playerHeight,
-              backgroundColor: getMockColor(currentTimeUs),
-            }}
-          >
-            <span className="mock-label">Mock Capture</span>
-          </div>
+          {loading && (
+            <div className="player-loading">Loading clip...</div>
+          )}
 
-          {/* Input overlay */}
+          {error && (
+            <div className="player-error">
+              Failed to load clip: {error}
+            </div>
+          )}
+
+          {videoUrl && (
+            <video
+              ref={videoRef}
+              src={videoUrl}
+              width={playerWidth}
+              height={playerHeight}
+              onPlay={handleVideoPlay}
+              onPause={handleVideoPause}
+              onEnded={handleVideoEnded}
+              onLoadedMetadata={handleLoadedMetadata}
+              style={{ display: "block" }}
+            />
+          )}
+
+          {!loading && !error && !videoUrl && (
+            <div className="player-loading">No video data</div>
+          )}
+
           <InputOverlay
             events={inputEvents}
             currentTimeUs={currentTimeUs}
             width={playerWidth}
             height={playerHeight}
+            captureWidth={clip.width}
+            captureHeight={clip.height}
           />
         </div>
       </div>
 
-      {/* Playback controls */}
       <div className="player-controls">
-        <button className="btn-play" onClick={playing ? pause : play}>
+        <button
+          className="btn-play"
+          onClick={playing ? pause : play}
+          disabled={!videoUrl}
+        >
           {playing ? "Pause" : "Play"}
         </button>
 
@@ -159,57 +205,4 @@ function formatTime(us: number): string {
   const mins = Math.floor(totalSecs / 60);
   const secs = totalSecs % 60;
   return `${mins}:${secs.toString().padStart(2, "0")}`;
-}
-
-function getMockColor(timeUs: number): string {
-  const colors = ["#e74c3c", "#2ecc71", "#3498db", "#f1c40f"];
-  const idx = Math.floor(timeUs / 500_000) % colors.length;
-  return colors[idx];
-}
-
-function generateMockInputEvents(clip: ClipSummary): InputEvent[] {
-  const events: InputEvent[] = [];
-  const durationUs = clip.duration_secs * 1_000_000;
-  const keys = ["KeyW", "KeyA", "KeyS", "KeyD", "Space"];
-
-  for (let t = 0; t < durationUs; t += 100_000) {
-    // Key press every 100ms
-    const key = keys[Math.floor(t / 100_000) % keys.length];
-    events.push({
-      timestamp_us: t,
-      type: "key",
-      key,
-      pressed: true,
-    });
-    events.push({
-      timestamp_us: t + 80_000,
-      type: "key",
-      key,
-      pressed: false,
-    });
-
-    // Mouse move every 200ms
-    if (t % 200_000 === 0) {
-      events.push({
-        timestamp_us: t,
-        type: "mouse_move",
-        x: 960 + Math.sin(t / 1_000_000) * 400,
-        y: 540 + Math.cos(t / 1_000_000) * 300,
-      });
-    }
-
-    // Mouse click every 500ms
-    if (t % 500_000 === 0) {
-      events.push({
-        timestamp_us: t,
-        type: "mouse_button",
-        button: "left",
-        pressed: true,
-        x: 960 + Math.sin(t / 1_000_000) * 400,
-        y: 540 + Math.cos(t / 1_000_000) * 300,
-      });
-    }
-  }
-
-  return events;
 }
