@@ -1,5 +1,6 @@
 use super::{AudioBuffer, AudioCapture, AudioConfig, AudioError};
 use crate::sync::clock::SyncClock;
+use log::error;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -55,7 +56,7 @@ impl AudioCapture for WindowsAudioCapture {
 
         thread::spawn(move || {
             if let Err(e) = wasapi_capture_loop(running.clone(), buffers, clock, config) {
-                eprintln!("[GameClip] WASAPI capture error: {e}");
+                error!("WASAPI capture error: {e}");
                 if let Ok(mut r) = running.lock() {
                     *r = false;
                 }
@@ -181,7 +182,7 @@ fn wasapi_capture_loop(
                 }
             }
             Err(e) => {
-                eprintln!("[GameClip] WASAPI read error: {e}");
+                error!("WASAPI read error: {e}");
             }
         }
 

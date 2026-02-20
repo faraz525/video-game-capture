@@ -30,6 +30,14 @@ pub struct ClipMetadata {
     pub created_at: DateTime<Utc>,
     /// Input devices detected during capture.
     pub devices: CaptureDevices,
+    /// Whether the video data is encoded as H.264 MP4 (true) or raw RGBA (false).
+    /// Defaults to true for backwards compatibility with older clips.
+    #[serde(default = "default_video_encoded")]
+    pub video_encoded: bool,
+}
+
+fn default_video_encoded() -> bool {
+    true
 }
 
 /// Input devices that were active during capture.
@@ -57,6 +65,7 @@ impl ClipMetadata {
             audio_channels: None,
             created_at: Utc::now(),
             devices: CaptureDevices::default(),
+            video_encoded: true,
         }
     }
 }
@@ -85,6 +94,7 @@ mod tests {
                 mouse: true,
                 controller: false,
             },
+            video_encoded: true,
         };
 
         let json = serde_json::to_string_pretty(&meta).unwrap();

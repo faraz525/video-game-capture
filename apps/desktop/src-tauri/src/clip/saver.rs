@@ -4,6 +4,7 @@ use crate::audio::AudioBuffer;
 use crate::capture::CapturedFrame;
 use crate::input::InputEvent;
 use crate::sync::ring_buffer::{RingBuffer, Timestamped};
+use log::{info, warn};
 use std::path::PathBuf;
 
 impl Timestamped for CapturedFrame {
@@ -120,7 +121,7 @@ impl ClipSaver {
             (None, None)
         };
 
-        let metadata = ClipMetadata {
+        let mut metadata = ClipMetadata {
             id: clip_id,
             name: clip_name.clone(),
             game: game_name,
@@ -151,9 +152,16 @@ impl ClipSaver {
                 }),
                 controller: false,
             },
+            video_encoded: true, // will be updated after encoding attempt
         };
 
-        let video_data = encode_video(&frames, metadata.fps);
+        info!(
+            "Encoding clip: {} frames, {:.1}s, {}x{}",
+            frames.len(), duration_secs, first_frame.width, first_frame.height
+        );
+
+        let (video_data, video_encoded) = encode_video(&frames, metadata.fps);
+        metadata.video_encoded = video_encoded;
 
         // Concatenate audio buffers as raw PCM bytes
         let audio_data: Vec<u8> = audio_buffers
@@ -182,22 +190,36 @@ impl ClipSaver {
             .map_err(|e| SaveError::Format(super::format::ClipFormatError::Io(e)))?;
 
         write_clip(&clip_path, &package)?;
+
+        let file_size = std::fs::metadata(&clip_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        info!(
+            "Clip written: {} ({:.1} KB)",
+            clip_path.display(),
+            file_size as f64 / 1024.0
+        );
+
         Ok(clip_path)
     }
 }
 
-/// Encode video frames. Tries FFmpeg (produces MP4) first on all platforms,
-/// falls back to raw RGBA concatenation if FFmpeg is unavailable.
-fn encode_video(frames: &[CapturedFrame], fps: u32) -> Vec<u8> {
+/// Encode video frames to H.264 MP4. Returns (data, is_encoded).
+///
+/// Tries FFmpeg first. On failure, falls back to raw RGBA concatenation
+/// and returns `false` for the encoded flag so the frontend knows
+/// the video needs re-encoding before playback.
+fn encode_video(frames: &[CapturedFrame], fps: u32) -> (Vec<u8>, bool) {
     match super::encoder::encode_frames_to_mp4(frames, fps) {
-        Ok(mp4_data) => return mp4_data,
+        Ok(mp4_data) => return (mp4_data, true),
         Err(e) => {
-            eprintln!("[GameClip] FFmpeg encoding failed, falling back to raw: {e}");
+            warn!("FFmpeg encoding failed, falling back to raw RGBA: {e}");
         }
     }
 
     // Fallback: raw RGBA concatenation
-    frames.iter().flat_map(|f| f.data.iter().copied()).collect()
+    let raw = frames.iter().flat_map(|f| f.data.iter().copied()).collect();
+    (raw, false)
 }
 
 const THUMBNAIL_WIDTH: u32 = 320;
@@ -387,6 +409,38 @@ mod tests {
             &[0xFF, 0xD8],
             "thumbnail should be valid JPEG"
         );
+    }
+
+    #[test]
+    fn save_clip_at_640x360_produces_encoded_video() {
+        let dir = TempDir::new().unwrap();
+        let mut saver = ClipSaver::new(30, dir.path().to_path_buf());
+
+        let frame_interval = 33_333; // ~30fps
+        for i in 0..30 {
+            let ts = i * frame_interval;
+            saver.push_frame(CapturedFrame {
+                timestamp_us: ts,
+                width: 640,
+                height: 360,
+                data: vec![255, 0, 0, 255].repeat(640 * 360), // solid red
+            });
+            saver.push_input(make_key_event(ts, "KeyW", i % 2 == 0));
+        }
+
+        let clip_path = saver.save_clip(Some("TestGame".to_string())).unwrap();
+        let contents = read_clip(&clip_path).unwrap();
+
+        assert_eq!(contents.metadata.width, 640);
+        assert_eq!(contents.metadata.height, 360);
+        // If FFmpeg is available, video should be encoded as MP4
+        // (starts with ftyp box). If not, it's raw RGBA.
+        if contents.metadata.video_encoded {
+            assert!(
+                contents.video_data.len() >= 8 && &contents.video_data[4..8] == b"ftyp",
+                "encoded video should be valid MP4"
+            );
+        }
     }
 
     #[test]

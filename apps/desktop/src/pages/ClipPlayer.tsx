@@ -150,6 +150,9 @@ export function ClipPlayer({ clip, onBack }: ClipPlayerProps) {
               onPause={handleVideoPause}
               onEnded={handleVideoEnded}
               onLoadedMetadata={handleLoadedMetadata}
+              onError={() => {
+                setPlaying(false);
+              }}
               style={{ display: "block" }}
             />
           )}

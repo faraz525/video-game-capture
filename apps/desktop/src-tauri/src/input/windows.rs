@@ -3,6 +3,7 @@ use super::{
     MouseButtonEvent, MouseMoveEvent, MouseScrollEvent,
 };
 use crate::sync::clock::SyncClock;
+use log::error;
 use std::mem::MaybeUninit;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -75,7 +76,7 @@ impl InputRecorder for WindowsInputRecorder {
 
         thread::spawn(move || {
             if let Err(e) = run_raw_input_loop(events, clock, hwnd_store) {
-                eprintln!("[GameClip] Raw input loop error: {e}");
+                error!("Raw input loop error: {e}");
             }
         });
 

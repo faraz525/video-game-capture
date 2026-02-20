@@ -3,6 +3,9 @@ pub mod mock;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
+#[cfg(target_os = "macos")]
+pub mod macos;
+
 use crate::sync::clock::TimestampUs;
 
 /// A single captured video frame with its timestamp and pixel data.

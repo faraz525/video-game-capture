@@ -14,6 +14,7 @@ export interface ClipSummary {
   width: number;
   height: number;
   fps: number;
+  video_encoded: boolean;
 }
 
 export function useClips() {
@@ -64,10 +65,13 @@ export function useClips() {
   useEffect(() => {
     const unlisten = listen("clip-saved", () => {
       fetchClips();
+    }).catch((err) => {
+      console.warn("clip-saved listener failed to register:", err);
+      return null;
     });
 
     return () => {
-      unlisten.then((fn) => fn());
+      unlisten.then((fn) => fn?.());
     };
   }, [fetchClips]);
 

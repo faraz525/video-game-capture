@@ -8,6 +8,7 @@ mod sync;
 mod commands;
 mod engine;
 
+use log::{error, info};
 use std::sync::Arc;
 use tauri::{
     menu::{Menu, MenuItem},
@@ -44,6 +45,50 @@ pub fn run() {
                 })
                 .build(app)?;
 
+            // Initialize file + terminal logging
+            {
+                use simplelog::{
+                    CombinedLogger, Config, LevelFilter, TermLogger, TerminalMode,
+                    WriteLogger, ColorChoice,
+                };
+
+                let home = std::env::var("HOME")
+                    .or_else(|_| std::env::var("USERPROFILE"))
+                    .unwrap_or_else(|_| ".".to_string());
+                let log_dir = std::path::PathBuf::from(&home).join("GameClip");
+                let _ = std::fs::create_dir_all(&log_dir);
+                let log_path = log_dir.join("gameclip.log");
+
+                let file_logger: Box<dyn simplelog::SharedLogger> = match std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log_path)
+                {
+                    Ok(file) => WriteLogger::new(LevelFilter::Debug, Config::default(), file),
+                    Err(_) => WriteLogger::new(
+                        LevelFilter::Debug,
+                        Config::default(),
+                        std::io::sink(),
+                    ),
+                };
+
+                let _ = CombinedLogger::init(vec![
+                    TermLogger::new(
+                        LevelFilter::Debug,
+                        Config::default(),
+                        TerminalMode::Mixed,
+                        ColorChoice::Auto,
+                    ),
+                    file_logger,
+                ]);
+
+                info!(
+                    "GameClip v{} starting — log file: {}",
+                    env!("CARGO_PKG_VERSION"),
+                    log_path.display()
+                );
+            }
+
             // Start the capture engine
             {
                 let state = app.state::<engine::EngineState>();
@@ -72,8 +117,8 @@ pub fn run() {
                                 std::thread::spawn(move || {
                                     match engine::save_clip(&saver) {
                                         Ok(path) => {
-                                            println!(
-                                                "[GameClip] Clip saved: {}",
+                                            info!(
+                                                "Clip saved: {}",
                                                 path.display()
                                             );
                                             if let Some(window) =
@@ -83,7 +128,7 @@ pub fn run() {
                                             }
                                         }
                                         Err(e) => {
-                                            eprintln!("[GameClip] Failed to save clip: {e}");
+                                            error!("Failed to save clip: {e}");
                                         }
                                     }
                                 });

@@ -5,7 +5,9 @@ use std::time::{Duration, Instant};
 /// Mock screen capture that generates synthetic colored frames.
 ///
 /// Produces solid-color frames that cycle through red, green, blue, and yellow
-/// at the configured FPS. Used for development and testing on non-Windows platforms.
+/// at the configured FPS. Used for development and testing on platforms without
+/// a native capture implementation.
+#[allow(dead_code)]
 pub struct MockCapture {
     config: Option<CaptureConfig>,
     clock: SyncClock,
@@ -14,6 +16,7 @@ pub struct MockCapture {
     last_frame_time: Option<Instant>,
 }
 
+#[allow(dead_code)]
 impl MockCapture {
     pub fn new(clock: SyncClock) -> Self {
         Self {

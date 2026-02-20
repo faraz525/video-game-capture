@@ -4,6 +4,7 @@ use crate::capture::{CaptureConfig, ScreenCapture};
 use crate::clip::saver::ClipSaver;
 use crate::input::InputRecorder;
 use crate::sync::clock::SyncClock;
+use log::{error, info, warn};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -38,9 +39,9 @@ impl Default for AppSettings {
             buffer_duration_secs: DEFAULT_BUFFER_SECS,
             save_directory: save_dir,
             hotkey: "Ctrl+Shift+R".to_string(),
-            capture_fps: 60,
-            capture_width: 1920,
-            capture_height: 1080,
+            capture_fps: 30,
+            capture_width: 640,
+            capture_height: 360,
         }
     }
 }
@@ -59,7 +60,12 @@ fn create_screen_capture(clock: SyncClock) -> Box<dyn ScreenCapture> {
     Box::new(crate::capture::windows::WindowsCapture::new(clock))
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+fn create_screen_capture(clock: SyncClock) -> Box<dyn ScreenCapture> {
+    Box::new(crate::capture::macos::MacOSCapture::new(clock))
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn create_screen_capture(clock: SyncClock) -> Box<dyn ScreenCapture> {
     Box::new(crate::capture::mock::MockCapture::new(clock))
 }
@@ -70,7 +76,12 @@ fn create_input_recorder(clock: SyncClock) -> Box<dyn InputRecorder> {
     Box::new(crate::input::windows::WindowsInputRecorder::new(clock))
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+fn create_input_recorder(clock: SyncClock) -> Box<dyn InputRecorder> {
+    Box::new(crate::input::macos::MacOSInputRecorder::new(clock))
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn create_input_recorder(clock: SyncClock) -> Box<dyn InputRecorder> {
     Box::new(crate::input::mock::MockInputRecorder::new(clock))
 }
@@ -128,20 +139,22 @@ pub fn start_capture(state: &EngineState) -> Result<(), Box<dyn std::error::Erro
         let audio_config = AudioConfig::default();
 
         if let Err(e) = screen.start(config) {
-            eprintln!("[GameClip] Failed to start capture: {e}");
+            error!("Failed to start capture: {e}");
             running.store(false, Ordering::SeqCst);
             return;
         }
         if let Err(e) = input.start() {
-            eprintln!("[GameClip] Failed to start input recorder: {e}");
+            error!("Failed to start input recorder: {e}");
             running.store(false, Ordering::SeqCst);
             return;
         }
         if let Err(e) = audio.start(audio_config) {
-            eprintln!("[GameClip] Failed to start audio capture: {e}");
+            error!("Failed to start audio capture: {e}");
             running.store(false, Ordering::SeqCst);
             return;
         }
+
+        info!("Capture engine started ({}x{} @ {}fps)", settings.capture_width, settings.capture_height, settings.capture_fps);
 
         while running.load(Ordering::Relaxed) {
             if let Ok(Some(frame)) = screen.poll_frame() {
@@ -178,7 +191,7 @@ pub fn start_capture(state: &EngineState) -> Result<(), Box<dyn std::error::Erro
 /// Lock the saver mutex, recovering from poison if necessary.
 fn lock_or_recover(saver: &Arc<Mutex<ClipSaver>>) -> std::sync::MutexGuard<'_, ClipSaver> {
     saver.lock().unwrap_or_else(|poisoned| {
-        eprintln!("[GameClip] Saver mutex poisoned, recovering");
+        warn!("Saver mutex poisoned, recovering");
         poisoned.into_inner()
     })
 }

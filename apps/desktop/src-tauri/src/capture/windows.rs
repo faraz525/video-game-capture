@@ -1,5 +1,6 @@
 use super::{CaptureConfig, CaptureError, CapturedFrame, ScreenCapture};
 use crate::sync::clock::SyncClock;
+use log::{error, warn};
 use std::time::{Duration, Instant};
 use win_desktop_duplication::devices::AdapterFactory;
 use win_desktop_duplication::tex_reader::TextureReader;
@@ -116,7 +117,7 @@ impl ScreenCapture for WindowsCapture {
                 let err_msg = format!("{e:?}");
                 // Handle AccessLost by reinitializing
                 if err_msg.contains("AccessLost") || err_msg.contains("DXGI_ERROR_ACCESS_LOST") {
-                    eprintln!("[GameClip] DXGI access lost, reinitializing...");
+                    warn!("DXGI access lost, reinitializing...");
                     if let Err(reinit_err) = self.init_duplication() {
                         return Err(CaptureError::Platform(format!(
                             "Reinit failed: {reinit_err}"
@@ -134,7 +135,7 @@ impl ScreenCapture for WindowsCapture {
         // get_data writes BGRA pixel data into the provided Vec
         let mut data = Vec::<u8>::new();
         if let Err(e) = reader.get_data(&mut data, &texture) {
-            eprintln!("[GameClip] TextureReader error: {e:?}");
+            error!("TextureReader error: {e:?}");
             return Ok(None);
         }
 

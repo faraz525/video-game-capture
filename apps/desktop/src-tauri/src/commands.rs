@@ -3,6 +3,7 @@ use crate::clip::metadata::ClipMetadata;
 use crate::engine::{AppSettings, EngineState};
 use crate::input::InputEvent;
 use base64::Engine as _;
+use log::{debug, info, warn};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -22,6 +23,7 @@ pub struct ClipSummary {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
+    pub video_encoded: bool,
 }
 
 /// List all saved clips from the save directory.
@@ -54,10 +56,11 @@ pub fn list_clips(state: State<'_, EngineState>) -> Result<Vec<ClipSummary>, Str
                         width: contents.metadata.width,
                         height: contents.metadata.height,
                         fps: contents.metadata.fps,
+                        video_encoded: contents.metadata.video_encoded,
                     });
                 }
                 Err(e) => {
-                    eprintln!("[GameClip] Failed to read clip {}: {e}", path.display());
+                    warn!("Failed to read clip {}: {e}", path.display());
                 }
             }
         }
@@ -120,8 +123,12 @@ pub fn update_settings(
 
 /// Extract video data from a .gameclip file and write to a temp MP4 file.
 /// Returns the temp file path for use with convertFileSrc().
+///
+/// If the clip's video is stored as raw RGBA (encoding failed at save time),
+/// this command re-encodes it to MP4 using FFmpeg before returning.
 #[tauri::command]
-pub fn extract_clip_video(file_path: String) -> Result<String, String> {
+pub async fn extract_clip_video(file_path: String) -> Result<String, String> {
+    debug!("Extracting video from clip: {file_path}");
     let path = PathBuf::from(&file_path);
     let contents = read_clip(&path).map_err(|e| e.to_string())?;
 
@@ -130,8 +137,42 @@ pub fn extract_clip_video(file_path: String) -> Result<String, String> {
 
     let out_path = playback_dir.join(format!("{}.mp4", contents.metadata.id));
 
-    fs::write(&out_path, &contents.video_data).map_err(|e| e.to_string())?;
+    // Detect if video is actually encoded MP4 by checking for ftyp box
+    // (older clips don't have video_encoded field, defaults to true incorrectly)
+    let is_mp4 = contents.video_data.len() >= 8
+        && &contents.video_data[4..8] == b"ftyp";
+    let is_encoded = contents.metadata.video_encoded && is_mp4;
 
+    if is_encoded {
+        debug!("Video is already encoded MP4, writing {} bytes", contents.video_data.len());
+        fs::write(&out_path, &contents.video_data).map_err(|e| e.to_string())?;
+        return Ok(out_path.to_string_lossy().to_string());
+    }
+
+    // Raw RGBA data — re-encode to MP4 on a blocking thread
+    info!(
+        "Re-encoding raw RGBA video for clip {} ({}x{} @ {}fps)",
+        contents.metadata.id, contents.metadata.width, contents.metadata.height, contents.metadata.fps
+    );
+
+    let meta = contents.metadata.clone();
+    let video_data = contents.video_data;
+    let out = out_path.clone();
+
+    let mp4_data = tauri::async_runtime::spawn_blocking(move || {
+        crate::clip::encoder::reencode_raw_to_mp4(
+            &video_data,
+            meta.width,
+            meta.height,
+            meta.fps,
+        )
+    })
+    .await
+    .map_err(|e| format!("spawn error: {e}"))?
+    .map_err(|e| format!("re-encode failed: {e}"))?;
+
+    fs::write(&out, &mp4_data).map_err(|e| e.to_string())?;
+    info!("Re-encoded clip written to {}", out.display());
     Ok(out_path.to_string_lossy().to_string())
 }
 
@@ -139,6 +180,7 @@ pub fn extract_clip_video(file_path: String) -> Result<String, String> {
 /// Returns None if the clip has no thumbnail.
 #[tauri::command]
 pub fn get_clip_thumbnail(file_path: String) -> Result<Option<String>, String> {
+    debug!("Loading thumbnail for clip: {file_path}");
     let path = PathBuf::from(&file_path);
     let contents = read_clip(&path).map_err(|e| e.to_string())?;
 
