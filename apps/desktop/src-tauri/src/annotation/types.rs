@@ -32,11 +32,24 @@ pub struct FrameAction {
 /// Clip-level quality and interest scoring.
 ///
 /// Surfaces the most valuable training examples by measuring action density,
-/// input complexity, and detecting highlight moments.
+/// input complexity, and detecting highlight moments. Scoring is genre-aware:
+/// the same raw dimensions are weighted differently for an FPS clip vs. a
+/// racing game clip, so that each genre's clips are ranked fairly.
+///
+/// Providers can either use the pre-computed `overall_score` (genre-weighted)
+/// or ignore it and apply their own weights to `dimension_scores`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct QualityScore {
-    /// Overall quality score (0.0 to 1.0).
+    /// Overall quality score (0.0 to 1.0), weighted by genre.
     pub overall_score: f64,
+    /// Genre used for weighting (e.g., "fps", "racing", "moba", "unknown").
+    /// Providers can use this to understand how the overall_score was computed.
+    #[serde(default)]
+    pub genre: String,
+    /// Normalized dimension scores (0.0 to 1.0 each). These are genre-agnostic
+    /// and can be re-weighted by providers for their specific use case.
+    #[serde(default)]
+    pub dimension_scores: DimensionScores,
     /// Average input events per second.
     pub action_density: f64,
     /// Ratio of frames with active key/mouse input (0.0 to 1.0).
@@ -51,10 +64,42 @@ pub struct QualityScore {
     pub peak_mouse_speed: f64,
     /// Number of distinct keys used throughout the clip.
     pub unique_keys_used: u32,
+    /// Input continuity (0.0 to 1.0). Measures how evenly input is distributed
+    /// across the clip duration. High for sustained gameplay (driving, exploration),
+    /// low for bursty-then-idle clips.
+    #[serde(default)]
+    pub input_continuity: f64,
+    /// Mouse control smoothness (0.0 to 1.0). Measures purposeful, sustained
+    /// mouse movement vs. idle or erratic input.
+    #[serde(default)]
+    pub mouse_control_smoothness: f64,
     /// Detected highlight segments with high input intensity.
     pub highlights: Vec<HighlightSegment>,
     /// Flags for edge cases that are valuable for training.
     pub edge_case_flags: Vec<String>,
+}
+
+/// Normalized quality dimension scores (all 0.0 to 1.0).
+///
+/// These are genre-agnostic — the same computation regardless of game type.
+/// The genre-specific `overall_score` is produced by applying weight profiles
+/// to these dimensions. Providers who disagree with our genre weights can
+/// apply their own weights directly to these values.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct DimensionScores {
+    /// Events per second, normalized. High for fast-paced games.
+    pub action_density: f64,
+    /// Evenness of input distribution across clip duration.
+    /// High for sustained gameplay (driving, building), low for bursty-then-idle.
+    pub input_continuity: f64,
+    /// Variety of distinct keys/actions used.
+    pub input_diversity: f64,
+    /// Purposeful, sustained mouse movement. High for aiming/steering.
+    pub mouse_control: f64,
+    /// Complexity of simultaneous key combinations.
+    pub action_complexity: f64,
+    /// Detected highlight moments relative to clip length.
+    pub highlight_density: f64,
 }
 
 /// A segment of the clip identified as a highlight moment.
@@ -141,6 +186,15 @@ mod tests {
     fn quality_score_serializes_roundtrip() {
         let score = QualityScore {
             overall_score: 0.85,
+            genre: "fps".to_string(),
+            dimension_scores: DimensionScores {
+                action_density: 0.7,
+                input_continuity: 0.6,
+                input_diversity: 0.8,
+                mouse_control: 0.75,
+                action_complexity: 0.5,
+                highlight_density: 0.3,
+            },
             action_density: 42.5,
             input_activity_ratio: 0.73,
             avg_simultaneous_keys: 2.1,
@@ -148,6 +202,8 @@ mod tests {
             avg_mouse_speed: 450.0,
             peak_mouse_speed: 2400.0,
             unique_keys_used: 12,
+            input_continuity: 0.6,
+            mouse_control_smoothness: 0.75,
             highlights: vec![HighlightSegment {
                 start_us: 5_000_000,
                 end_us: 8_000_000,
@@ -160,6 +216,41 @@ mod tests {
         let json = serde_json::to_string(&score).unwrap();
         let deserialized: QualityScore = serde_json::from_str(&json).unwrap();
         assert_eq!(score, deserialized);
+    }
+
+    #[test]
+    fn quality_score_backwards_compatible_deserialization() {
+        // Simulate a quality.json from before genre scoring was added
+        let old_json = r#"{
+            "overall_score": 0.5,
+            "action_density": 20.0,
+            "input_activity_ratio": 0.6,
+            "avg_simultaneous_keys": 1.5,
+            "peak_simultaneous_keys": 3,
+            "avg_mouse_speed": 300.0,
+            "peak_mouse_speed": 1200.0,
+            "unique_keys_used": 8,
+            "highlights": [],
+            "edge_case_flags": []
+        }"#;
+
+        let score: QualityScore = serde_json::from_str(old_json).unwrap();
+        assert_eq!(score.overall_score, 0.5);
+        assert_eq!(score.genre, ""); // default
+        assert_eq!(score.dimension_scores, DimensionScores::default());
+        assert_eq!(score.input_continuity, 0.0); // default
+        assert_eq!(score.mouse_control_smoothness, 0.0); // default
+    }
+
+    #[test]
+    fn dimension_scores_default() {
+        let scores = DimensionScores::default();
+        assert_eq!(scores.action_density, 0.0);
+        assert_eq!(scores.input_continuity, 0.0);
+        assert_eq!(scores.input_diversity, 0.0);
+        assert_eq!(scores.mouse_control, 0.0);
+        assert_eq!(scores.action_complexity, 0.0);
+        assert_eq!(scores.highlight_density, 0.0);
     }
 
     #[test]

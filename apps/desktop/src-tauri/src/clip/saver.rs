@@ -182,6 +182,7 @@ impl ClipSaver {
             &input_events,
             duration_secs,
             metadata.fps,
+            metadata.game.as_deref(),
         );
         let frame_actions = annotations.frame_actions.unwrap_or_default();
         let quality_score = annotations.quality;

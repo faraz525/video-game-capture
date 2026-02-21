@@ -77,6 +77,7 @@ pub fn export_clip_json_sidecar(
         contents.metadata.duration_secs,
         fps,
         first_ts,
+        contents.metadata.game.as_deref(),
     );
 
     // Write video.mp4 (or video.bin if not encoded)

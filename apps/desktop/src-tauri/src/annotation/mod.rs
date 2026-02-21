@@ -16,10 +16,12 @@ use types::{AnnotationManifest, ClipAnnotations, FrameAction, QualityScore};
 ///
 /// Generates:
 /// - Per-frame action snapshots (frame_actions)
-/// - Quality and interest scores (quality)
+/// - Quality and interest scores (quality, genre-weighted)
 ///
 /// This is the core function that transforms raw .gameclip capture data
 /// into ML-ready annotated data suitable for world model training.
+/// The game name from the clip metadata is used to determine genre and
+/// apply appropriate quality scoring weights.
 pub fn annotate_clip(clip_path: &Path) -> Result<ClipAnnotations, AnnotationError> {
     let contents = read_clip(clip_path).map_err(AnnotationError::ClipFormat)?;
 
@@ -27,13 +29,15 @@ pub fn annotate_clip(clip_path: &Path) -> Result<ClipAnnotations, AnnotationErro
         &contents.input_events,
         contents.metadata.duration_secs,
         contents.metadata.fps,
+        contents.metadata.game.as_deref(),
     );
 
     info!(
-        "Annotated clip {}: {} frame actions, quality={:.2}",
+        "Annotated clip {}: {} frame actions, quality={:.2} (genre={})",
         clip_path.display(),
         annotations.frame_actions.as_ref().map(|a| a.len()).unwrap_or(0),
         annotations.quality.as_ref().map(|q| q.overall_score).unwrap_or(0.0),
+        annotations.quality.as_ref().map(|q| q.genre.as_str()).unwrap_or("unknown"),
     );
 
     Ok(annotations)
@@ -42,17 +46,19 @@ pub fn annotate_clip(clip_path: &Path) -> Result<ClipAnnotations, AnnotationErro
 /// Run annotation pipeline directly from input events and metadata.
 ///
 /// This avoids reading from disk when the data is already in memory
-/// (e.g., during clip save).
+/// (e.g., during clip save). The `game_name` is used to determine the
+/// genre for quality score weighting.
 pub fn annotate_from_events(
     input_events: &[InputEvent],
     duration_secs: f64,
     fps: u32,
+    game_name: Option<&str>,
 ) -> ClipAnnotations {
     let first_ts = input_events.first().map(|e| e.timestamp_us).unwrap_or(0);
     let (frame_count, fps) = compute_frame_params(duration_secs, fps);
 
     let frame_actions = index_frame_actions(input_events, frame_count, fps, first_ts);
-    let quality = score_clip_quality(input_events, duration_secs, fps, first_ts);
+    let quality = score_clip_quality(input_events, duration_secs, fps, first_ts, game_name);
 
     ClipAnnotations {
         manifest: AnnotationManifest {
@@ -87,6 +93,7 @@ pub fn get_quality_score(clip_path: &Path) -> Result<QualityScore, AnnotationErr
         contents.metadata.duration_secs,
         contents.metadata.fps,
         first_ts,
+        contents.metadata.game.as_deref(),
     ))
 }
 
@@ -224,7 +231,7 @@ mod tests {
             },
         ];
 
-        let annotations = annotate_from_events(&events, 1.0, 30);
+        let annotations = annotate_from_events(&events, 1.0, 30, None);
 
         assert!(annotations.frame_actions.is_some());
         let actions = annotations.frame_actions.unwrap();
