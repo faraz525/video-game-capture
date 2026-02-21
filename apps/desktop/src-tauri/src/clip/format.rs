@@ -1,4 +1,5 @@
 use super::metadata::ClipMetadata;
+use crate::annotation::types::{FrameAction, QualityScore};
 use crate::input::InputEvent;
 use std::fs::File;
 use std::io::{Read, Write};
@@ -29,6 +30,10 @@ pub struct ClipPackageData {
     pub audio_data: Vec<u8>,
     /// JPEG thumbnail bytes.
     pub thumbnail: Vec<u8>,
+    /// Per-frame action annotations (optional).
+    pub frame_actions: Vec<FrameAction>,
+    /// Quality score annotations (optional).
+    pub quality_score: Option<QualityScore>,
 }
 
 /// Write a .gameclip package to disk.
@@ -74,6 +79,23 @@ pub fn write_clip(path: &Path, data: &ClipPackageData) -> Result<(), ClipFormatE
         zip.write_all(&data.thumbnail)?;
     }
 
+    // frame_actions.jsonl (annotation layer)
+    if !data.frame_actions.is_empty() {
+        zip.start_file("frame_actions.jsonl", options)?;
+        for action in &data.frame_actions {
+            let line = serde_json::to_string(action)?;
+            zip.write_all(line.as_bytes())?;
+            zip.write_all(b"\n")?;
+        }
+    }
+
+    // quality.json (annotation layer)
+    if let Some(ref quality) = data.quality_score {
+        zip.start_file("quality.json", options)?;
+        let quality_json = serde_json::to_string_pretty(quality)?;
+        zip.write_all(quality_json.as_bytes())?;
+    }
+
     zip.finish()?;
     Ok(())
 }
@@ -86,6 +108,8 @@ pub struct ClipPackageContents {
     pub video_data: Vec<u8>,
     pub audio_data: Vec<u8>,
     pub thumbnail: Vec<u8>,
+    pub frame_actions: Vec<FrameAction>,
+    pub quality_score: Option<QualityScore>,
 }
 
 /// Read a .gameclip package from disk.
@@ -146,12 +170,37 @@ pub fn read_clip(path: &Path) -> Result<ClipPackageContents, ClipFormatError> {
         Err(_) => Vec::new(),
     };
 
+    // frame_actions.jsonl (optional annotation layer)
+    let frame_actions = match archive.by_name("frame_actions.jsonl") {
+        Ok(mut entry) => {
+            let mut buf = String::new();
+            entry.read_to_string(&mut buf)?;
+            buf.lines()
+                .filter(|line| !line.is_empty())
+                .map(serde_json::from_str)
+                .collect::<Result<Vec<_>, _>>()?
+        }
+        Err(_) => Vec::new(),
+    };
+
+    // quality.json (optional annotation layer)
+    let quality_score = match archive.by_name("quality.json") {
+        Ok(mut entry) => {
+            let mut buf = String::new();
+            entry.read_to_string(&mut buf)?;
+            Some(serde_json::from_str(&buf)?)
+        }
+        Err(_) => None,
+    };
+
     Ok(ClipPackageContents {
         metadata,
         input_events,
         video_data,
         audio_data,
         thumbnail,
+        frame_actions,
+        quality_score,
     })
 }
 
@@ -187,6 +236,8 @@ mod tests {
             video_data: vec![0xFF, 0x00, 0x00, 0xFF], // fake frame
             audio_data: vec![0x00; 1024],
             thumbnail: vec![0xFF, 0xD8, 0xFF], // fake JPEG header
+            frame_actions: vec![],
+            quality_score: None,
         }
     }
 
