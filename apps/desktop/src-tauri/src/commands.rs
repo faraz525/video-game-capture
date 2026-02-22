@@ -1,3 +1,6 @@
+use crate::annotation;
+use crate::annotation::export::ExportResult;
+use crate::annotation::types::{ClipAnnotations, FrameAction, QualityScore};
 use crate::clip::format::read_clip;
 use crate::clip::metadata::ClipMetadata;
 use crate::engine::{AppSettings, EngineState};
@@ -24,6 +27,7 @@ pub struct ClipSummary {
     pub height: u32,
     pub fps: u32,
     pub video_encoded: bool,
+    pub annotation_layers: Vec<String>,
 }
 
 /// List all saved clips from the save directory.
@@ -57,6 +61,7 @@ pub fn list_clips(state: State<'_, EngineState>) -> Result<Vec<ClipSummary>, Str
                         height: contents.metadata.height,
                         fps: contents.metadata.fps,
                         video_encoded: contents.metadata.video_encoded,
+                        annotation_layers: contents.metadata.annotation_layers.clone(),
                     });
                 }
                 Err(e) => {
@@ -198,4 +203,130 @@ pub fn get_clip_input_events(file_path: String) -> Result<Vec<InputEvent>, Strin
     let path = PathBuf::from(&file_path);
     let contents = read_clip(&path).map_err(|e| e.to_string())?;
     Ok(contents.input_events)
+}
+
+// --- Annotation Pipeline Commands ---
+
+/// Run the annotation pipeline on a clip and return the results.
+///
+/// Generates per-frame action snapshots and quality scores.
+/// Does not modify the clip file — returns the annotations for display.
+#[tauri::command]
+pub fn annotate_clip(file_path: String) -> Result<ClipAnnotations, String> {
+    let path = PathBuf::from(&file_path);
+    annotation::annotate_clip(&path).map_err(|e| e.to_string())
+}
+
+/// Get per-frame action data for a clip.
+///
+/// If the clip already has frame actions stored in the zip, returns those.
+/// Otherwise, generates them on-the-fly from the input events.
+#[tauri::command]
+pub fn get_frame_actions(file_path: String) -> Result<Vec<FrameAction>, String> {
+    let path = PathBuf::from(&file_path);
+    let contents = read_clip(&path).map_err(|e| e.to_string())?;
+
+    // Return stored annotations if available
+    if !contents.frame_actions.is_empty() {
+        return Ok(contents.frame_actions);
+    }
+
+    // Generate on-the-fly
+    annotation::get_frame_actions(&path).map_err(|e| e.to_string())
+}
+
+/// Get quality score for a clip.
+///
+/// If the clip already has a quality score stored in the zip, returns that.
+/// Otherwise, generates it on-the-fly.
+#[tauri::command]
+pub fn get_quality_score(file_path: String) -> Result<QualityScore, String> {
+    let path = PathBuf::from(&file_path);
+    let contents = read_clip(&path).map_err(|e| e.to_string())?;
+
+    // Return stored quality if available
+    if let Some(quality) = contents.quality_score {
+        return Ok(quality);
+    }
+
+    // Generate on-the-fly
+    annotation::get_quality_score(&path).map_err(|e| e.to_string())
+}
+
+/// Export clips to a researcher-friendly format.
+///
+/// Supported formats:
+/// - "json_sidecar": MP4 + JSON files in a flat directory
+/// - "huggingface": HuggingFace Datasets-compatible structure
+#[tauri::command]
+pub async fn export_clips(
+    state: State<'_, EngineState>,
+    clip_paths: Vec<String>,
+    format: String,
+    output_dir: String,
+) -> Result<ExportResult, String> {
+    let paths: Vec<PathBuf> = clip_paths.iter().map(PathBuf::from).collect();
+    let out = PathBuf::from(&output_dir);
+
+    // If no specific clips provided, export all clips from the save directory
+    let paths = if paths.is_empty() {
+        let settings = state.settings.lock().map_err(|e| e.to_string())?;
+        let save_dir = PathBuf::from(&settings.save_directory);
+        if !save_dir.exists() {
+            return Err("Save directory does not exist".to_string());
+        }
+        fs::read_dir(&save_dir)
+            .map_err(|e| e.to_string())?
+            .flatten()
+            .filter(|e| e.path().extension().and_then(|ext| ext.to_str()) == Some("gameclip"))
+            .map(|e| e.path())
+            .collect()
+    } else {
+        paths
+    };
+
+    info!(
+        "Exporting {} clips as {} to {}",
+        paths.len(),
+        format,
+        output_dir,
+    );
+
+    match format.as_str() {
+        "json_sidecar" => {
+            // Export each clip to its own subdirectory
+            let mut total_exported = 0u32;
+            for path in &paths {
+                let clip_name = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown");
+                let clip_out = out.join(clip_name);
+                match annotation::export::export_clip_json_sidecar(path, &clip_out) {
+                    Ok(_) => total_exported += 1,
+                    Err(e) => warn!("Failed to export {}: {e}", path.display()),
+                }
+            }
+            Ok(ExportResult {
+                output_dir: out.to_string_lossy().to_string(),
+                clips_exported: total_exported,
+                stats: crate::annotation::types::DatasetStats {
+                    total_clips: total_exported,
+                    total_duration_secs: 0.0,
+                    total_frames: 0,
+                    total_input_events: 0,
+                    games: vec![],
+                    avg_quality_score: 0.0,
+                    resolutions: vec![],
+                    fps_values: vec![],
+                },
+                format: "json_sidecar".to_string(),
+            })
+        }
+        "huggingface" => {
+            annotation::export::export_dataset_huggingface(&paths, &out)
+                .map_err(|e| e.to_string())
+        }
+        _ => Err(format!("Unknown export format: {format}. Use 'json_sidecar' or 'huggingface'")),
+    }
 }

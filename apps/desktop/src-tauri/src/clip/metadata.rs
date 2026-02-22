@@ -34,6 +34,10 @@ pub struct ClipMetadata {
     /// Defaults to true for backwards compatibility with older clips.
     #[serde(default = "default_video_encoded")]
     pub video_encoded: bool,
+    /// Annotation layers present in this clip (e.g., "frame_actions", "quality").
+    /// Empty for unannotated clips. Defaults to empty for backwards compatibility.
+    #[serde(default)]
+    pub annotation_layers: Vec<String>,
 }
 
 fn default_video_encoded() -> bool {
@@ -66,6 +70,7 @@ impl ClipMetadata {
             created_at: Utc::now(),
             devices: CaptureDevices::default(),
             video_encoded: true,
+            annotation_layers: Vec::new(),
         }
     }
 }
@@ -95,6 +100,7 @@ mod tests {
                 controller: false,
             },
             video_encoded: true,
+            annotation_layers: vec!["frame_actions".to_string()],
         };
 
         let json = serde_json::to_string_pretty(&meta).unwrap();

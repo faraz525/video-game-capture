@@ -1,3 +1,4 @@
+mod annotation;
 mod audio;
 mod capture;
 mod clip;
@@ -152,6 +153,10 @@ pub fn run() {
             commands::extract_clip_video,
             commands::get_clip_thumbnail,
             commands::get_clip_input_events,
+            commands::annotate_clip,
+            commands::get_frame_actions,
+            commands::get_quality_score,
+            commands::export_clips,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

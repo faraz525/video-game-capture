@@ -1,5 +1,6 @@
 use super::format::{write_clip, ClipPackageData};
 use super::metadata::{CaptureDevices, ClipMetadata};
+use crate::annotation;
 use crate::audio::AudioBuffer;
 use crate::capture::CapturedFrame;
 use crate::input::InputEvent;
@@ -153,6 +154,7 @@ impl ClipSaver {
                 controller: false,
             },
             video_encoded: true, // will be updated after encoding attempt
+            annotation_layers: Vec::new(), // populated by auto-annotate below
         };
 
         info!(
@@ -175,12 +177,38 @@ impl ClipSaver {
 
         let thumbnail = generate_thumbnail(first_frame);
 
+        // Auto-annotate: generate per-frame action labels and quality scores
+        let annotations = annotation::annotate_from_events(
+            &input_events,
+            duration_secs,
+            metadata.fps,
+            metadata.game.as_deref(),
+        );
+        let frame_actions = annotations.frame_actions.unwrap_or_default();
+        let quality_score = annotations.quality;
+
+        // Update metadata with annotation layers
+        if !frame_actions.is_empty() {
+            metadata.annotation_layers.push("frame_actions".to_string());
+        }
+        if quality_score.is_some() {
+            metadata.annotation_layers.push("quality".to_string());
+        }
+
+        info!(
+            "Auto-annotated: {} frame actions, quality={:.2}",
+            frame_actions.len(),
+            quality_score.as_ref().map(|q| q.overall_score).unwrap_or(0.0),
+        );
+
         let package = ClipPackageData {
             metadata,
             input_events,
             video_data,
             audio_data,
             thumbnail,
+            frame_actions,
+            quality_score,
         };
 
         let filename = format!("{clip_name}.gameclip");
