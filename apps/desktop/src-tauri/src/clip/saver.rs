@@ -4,6 +4,7 @@ use crate::annotation;
 use crate::audio::AudioBuffer;
 use crate::capture::CapturedFrame;
 use crate::input::InputEvent;
+use crate::sync::encoded_ring_buffer::{EncodedChunk, EncodedRingBuffer};
 use crate::sync::ring_buffer::{RingBuffer, Timestamped};
 use log::{info, warn};
 use std::path::PathBuf;
@@ -40,6 +41,7 @@ pub struct ClipSaver {
     pub frames: RingBuffer<CapturedFrame>,
     pub input_events: RingBuffer<InputEvent>,
     pub audio_buffers: RingBuffer<AudioBuffer>,
+    pub encoded_chunks: Option<EncodedRingBuffer>,
     save_dir: PathBuf,
 }
 
@@ -52,7 +54,28 @@ impl ClipSaver {
             frames: RingBuffer::new(duration_us),
             input_events: RingBuffer::new(duration_us),
             audio_buffers: RingBuffer::new(duration_us),
+            encoded_chunks: None,
             save_dir,
+        }
+    }
+
+    /// Enable the encoded ring buffer for streaming encoding.
+    pub fn enable_encoded_buffer(&mut self, buffer_duration_secs: u32) {
+        let duration_us = buffer_duration_secs as u64 * 1_000_000;
+        self.encoded_chunks = Some(EncodedRingBuffer::new(duration_us));
+    }
+
+    /// Push an encoded chunk into the encoded ring buffer.
+    pub fn push_encoded_chunk(&mut self, chunk: EncodedChunk) {
+        if let Some(ref mut buf) = self.encoded_chunks {
+            buf.push(chunk);
+        }
+    }
+
+    /// Cache the first raw frame for thumbnail generation (used with streaming encoding).
+    pub fn cache_first_raw_frame(&mut self, frame: CapturedFrame) {
+        if let Some(ref mut buf) = self.encoded_chunks {
+            buf.cache_first_frame(frame);
         }
     }
 
@@ -85,7 +108,14 @@ impl ClipSaver {
         let audio_buffers = self.audio_buffers.drain();
         let save_dir = self.save_dir.clone();
 
-        Self::save_clip_from_data(frames, input_events, audio_buffers, game_name, &save_dir)
+        // Drain encoded video data if available
+        let encoded_video = self.encoded_chunks.as_mut().map(|buf| {
+            let video_data = buf.drain_as_fmp4();
+            let first_frame = buf.take_first_frame();
+            (video_data, first_frame)
+        });
+
+        Self::save_clip_from_data(frames, input_events, audio_buffers, encoded_video, game_name, &save_dir)
     }
 
     /// Package pre-drained data into a .gameclip file.
@@ -93,21 +123,52 @@ impl ClipSaver {
     /// This static method performs all heavy work (thumbnail, encoding, zip)
     /// without holding the saver mutex, minimizing lock contention with the
     /// capture thread.
+    ///
+    /// `encoded_video`: Optional pre-encoded fMP4 data + first raw frame from
+    /// the streaming encoder. When present, skips the FFmpeg batch encoding step.
     pub fn save_clip_from_data(
         frames: Vec<CapturedFrame>,
         input_events: Vec<InputEvent>,
         audio_buffers: Vec<AudioBuffer>,
+        encoded_video: Option<(Vec<u8>, Option<CapturedFrame>)>,
         game_name: Option<String>,
         save_dir: &std::path::Path,
     ) -> Result<PathBuf, SaveError> {
-        if frames.is_empty() {
+        // We need either raw frames or encoded video data
+        let has_encoded = encoded_video
+            .as_ref()
+            .map(|(data, _)| !data.is_empty())
+            .unwrap_or(false);
+
+        if frames.is_empty() && !has_encoded {
             return Err(SaveError::NoFrames);
         }
 
-        let first_frame = &frames[0];
-        let last_frame = &frames[frames.len() - 1];
-        let duration_us = last_frame.timestamp_us - first_frame.timestamp_us;
-        let duration_secs = duration_us as f64 / 1_000_000.0;
+        // Determine frame metadata from raw frames or encoded first frame
+        let (ref_frame_width, ref_frame_height, first_ts, last_ts, frame_count) =
+            if !frames.is_empty() {
+                let first = &frames[0];
+                let last = &frames[frames.len() - 1];
+                (first.width, first.height, first.timestamp_us, last.timestamp_us, frames.len())
+            } else if let Some((_, Some(ref first_frame))) = &encoded_video {
+                // Use the cached first frame for dimensions
+                (first_frame.width, first_frame.height, first_frame.timestamp_us, first_frame.timestamp_us, 0)
+            } else {
+                // Encoded data but no first frame cached — use defaults
+                (640, 360, 0, 0, 0)
+            };
+
+        let duration_us = last_ts.saturating_sub(first_ts);
+        let duration_secs = if has_encoded && frame_count == 0 {
+            // For streaming-encoded clips, estimate from input events
+            if let (Some(first_evt), Some(last_evt)) = (input_events.first(), input_events.last()) {
+                (last_evt.timestamp_us.saturating_sub(first_evt.timestamp_us)) as f64 / 1_000_000.0
+            } else {
+                0.0
+            }
+        } else {
+            duration_us as f64 / 1_000_000.0
+        };
 
         let clip_id = uuid::Uuid::new_v4().to_string();
         let clip_name = format!(
@@ -122,17 +183,19 @@ impl ClipSaver {
             (None, None)
         };
 
+        let fps_estimate = if duration_secs > 0.0 && frame_count > 0 {
+            (frame_count as f64 / duration_secs).round() as u32
+        } else {
+            60
+        };
+
         let mut metadata = ClipMetadata {
             id: clip_id,
             name: clip_name.clone(),
             game: game_name,
-            width: first_frame.width,
-            height: first_frame.height,
-            fps: if duration_secs > 0.0 {
-                (frames.len() as f64 / duration_secs).round() as u32
-            } else {
-                60
-            },
+            width: ref_frame_width,
+            height: ref_frame_height,
+            fps: fps_estimate,
             duration_secs,
             input_event_count: input_events.len() as u64,
             has_audio,
@@ -153,16 +216,38 @@ impl ClipSaver {
                 }),
                 controller: false,
             },
-            video_encoded: true, // will be updated after encoding attempt
-            annotation_layers: Vec::new(), // populated by auto-annotate below
+            video_encoded: true,
+            video_start_timestamp_us: first_ts,
+            annotation_layers: Vec::new(),
+            format_version: 2,
+            checksums: std::collections::HashMap::new(),
         };
 
-        info!(
-            "Encoding clip: {} frames, {:.1}s, {}x{}",
-            frames.len(), duration_secs, first_frame.width, first_frame.height
-        );
-
-        let (video_data, video_encoded) = encode_video(&frames, metadata.fps);
+        // Select video data source: pre-encoded fMP4 or batch encode from raw frames
+        let (video_data, video_encoded, thumbnail_frame) = if let Some((enc_data, first_frame)) = encoded_video {
+            if !enc_data.is_empty() {
+                info!(
+                    "Using pre-encoded streaming video: {} bytes",
+                    enc_data.len()
+                );
+                (enc_data, true, first_frame)
+            } else {
+                // Empty encoded data — fall back to raw encoding
+                info!(
+                    "Encoded buffer empty, falling back to batch encoding: {} frames, {:.1}s, {}x{}",
+                    frames.len(), duration_secs, ref_frame_width, ref_frame_height
+                );
+                let (data, encoded) = encode_video(&frames, metadata.fps);
+                (data, encoded, None)
+            }
+        } else {
+            info!(
+                "Batch encoding clip: {} frames, {:.1}s, {}x{}",
+                frames.len(), duration_secs, ref_frame_width, ref_frame_height
+            );
+            let (data, encoded) = encode_video(&frames, metadata.fps);
+            (data, encoded, None)
+        };
         metadata.video_encoded = video_encoded;
 
         // Concatenate audio buffers as raw PCM bytes
@@ -175,7 +260,14 @@ impl ClipSaver {
             })
             .collect();
 
-        let thumbnail = generate_thumbnail(first_frame);
+        // Generate thumbnail from cached first frame or raw frames
+        let thumbnail = if let Some(ref thumb_frame) = thumbnail_frame {
+            generate_thumbnail(thumb_frame)
+        } else if !frames.is_empty() {
+            generate_thumbnail(&frames[0])
+        } else {
+            Vec::new()
+        };
 
         // Auto-annotate: generate per-frame action labels and quality scores
         let annotations = annotation::annotate_from_events(
@@ -307,6 +399,7 @@ mod tests {
     use crate::capture::CapturedFrame;
     use crate::clip::format::read_clip;
     use crate::input::{InputEventKind, KeyEvent, MouseMoveEvent};
+    use crate::sync::encoded_ring_buffer::{ChunkType, EncodedChunk};
     use tempfile::TempDir;
 
     fn make_frame(ts: u64) -> CapturedFrame {
@@ -484,5 +577,74 @@ mod tests {
 
         assert!(!contents.metadata.has_audio);
         assert!(contents.audio_data.is_empty());
+    }
+
+    // T11: save with encoded chunks sets video_encoded=true
+    #[test]
+    fn save_with_encoded_chunks_sets_video_encoded() {
+        let dir = TempDir::new().unwrap();
+
+        // Build fake fMP4 data (ftyp + moov + moof + mdat)
+        let mut fmp4_data = Vec::new();
+        // ftyp box
+        fmp4_data.extend_from_slice(&[0, 0, 0, 12]);
+        fmp4_data.extend_from_slice(b"ftyp");
+        fmp4_data.extend_from_slice(&[0, 0, 0, 0]);
+        // moov box
+        fmp4_data.extend_from_slice(&[0, 0, 0, 12]);
+        fmp4_data.extend_from_slice(b"moov");
+        fmp4_data.extend_from_slice(&[0, 0, 0, 0]);
+        // moof box
+        fmp4_data.extend_from_slice(&[0, 0, 0, 12]);
+        fmp4_data.extend_from_slice(b"moof");
+        fmp4_data.extend_from_slice(&[0, 0, 0, 0]);
+        // mdat box
+        fmp4_data.extend_from_slice(&[0, 0, 0, 12]);
+        fmp4_data.extend_from_slice(b"mdat");
+        fmp4_data.extend_from_slice(&[1, 2, 3, 4]);
+
+        let first_frame = Some(make_frame(0));
+        let input_events = vec![make_key_event(0, "KeyW", true), make_key_event(100_000, "KeyW", false)];
+
+        let clip_path = ClipSaver::save_clip_from_data(
+            vec![], // no raw frames
+            input_events,
+            vec![],
+            Some((fmp4_data, first_frame)),
+            Some("TestGame".to_string()),
+            dir.path(),
+        )
+        .unwrap();
+
+        let contents = read_clip(&clip_path).unwrap();
+        assert!(contents.metadata.video_encoded, "should be marked as encoded");
+        // Verify the video data starts with ftyp
+        assert!(
+            contents.video_data.len() >= 8 && &contents.video_data[4..8] == b"ftyp",
+            "video data should be fMP4"
+        );
+    }
+
+    // T12: save without encoded chunks falls back to raw RGBA
+    #[test]
+    fn save_without_encoded_chunks_falls_back_to_raw() {
+        let dir = TempDir::new().unwrap();
+
+        let frames = vec![make_frame(0), make_frame(16_667)];
+        let input_events = vec![make_key_event(0, "KeyW", true)];
+
+        let clip_path = ClipSaver::save_clip_from_data(
+            frames,
+            input_events,
+            vec![],
+            None, // no encoded video
+            None,
+            dir.path(),
+        )
+        .unwrap();
+
+        let contents = read_clip(&clip_path).unwrap();
+        // Should still produce a valid clip (either encoded via FFmpeg or raw)
+        assert!(!contents.video_data.is_empty());
     }
 }

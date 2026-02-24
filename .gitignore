@@ -31,3 +31,6 @@ pnpm-debug.log*
 # Clips (user data)
 *.gameclip
 clips/
+
+# FFmpeg sidecar binaries (downloaded via scripts/download-ffmpeg.sh)
+apps/desktop/src-tauri/binaries/ffmpeg-*

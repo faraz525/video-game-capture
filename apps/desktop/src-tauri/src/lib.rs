@@ -5,6 +5,7 @@ mod clip;
 mod game;
 mod input;
 mod sync;
+mod upload;
 
 mod commands;
 mod engine;
@@ -21,6 +22,7 @@ use tauri::{
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_shell::init())
         .manage(engine::create_engine_state())
         .setup(|app| {
             let settings_item =
@@ -90,6 +92,27 @@ pub fn run() {
                 );
             }
 
+            // Resolve FFmpeg sidecar path (if bundled with the app)
+            {
+                // The sidecar binary is placed next to the app executable
+                // by Tauri's bundling process. We resolve it by looking
+                // in the same directory as the current executable.
+                if let Ok(exe_path) = std::env::current_exe() {
+                    if let Some(exe_dir) = exe_path.parent() {
+                        let triple = env!("TAURI_ENV_TARGET_TRIPLE");
+                        let sidecar_name = format!("ffmpeg-{triple}");
+                        let sidecar_path = exe_dir.join(&sidecar_name);
+                        if sidecar_path.exists() {
+                            let path_str = sidecar_path.to_string_lossy().to_string();
+                            info!("FFmpeg sidecar resolved: {path_str}");
+                            clip::encoder::set_sidecar_path(path_str);
+                        } else {
+                            info!("FFmpeg sidecar not found at {}, will use system FFmpeg", sidecar_path.display());
+                        }
+                    }
+                }
+            }
+
             // Start the capture engine
             {
                 let state = app.state::<engine::EngineState>();
@@ -157,6 +180,8 @@ pub fn run() {
             commands::get_frame_actions,
             commands::get_quality_score,
             commands::export_clips,
+            commands::upload_clips,
+            commands::cancel_upload,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

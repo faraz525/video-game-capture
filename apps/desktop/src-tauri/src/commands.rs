@@ -5,12 +5,14 @@ use crate::clip::format::read_clip;
 use crate::clip::metadata::ClipMetadata;
 use crate::engine::{AppSettings, EngineState};
 use crate::input::InputEvent;
+use crate::upload::progress::UploadProgress;
 use base64::Engine as _;
 use log::{debug, info, warn};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use tauri::State;
+use tauri::{Emitter, State};
 
 /// Serializable clip summary for the frontend.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -197,12 +199,23 @@ pub fn get_clip_thumbnail(file_path: String) -> Result<Option<String>, String> {
     Ok(Some(format!("data:image/jpeg;base64,{b64}")))
 }
 
-/// Get input events from a .gameclip file.
+/// Input events bundled with the video start timestamp for playback sync.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ClipInputData {
+    pub events: Vec<InputEvent>,
+    pub video_start_timestamp_us: u64,
+}
+
+/// Get input events from a .gameclip file, along with the video start
+/// timestamp so the frontend can align input overlay with video playback.
 #[tauri::command]
-pub fn get_clip_input_events(file_path: String) -> Result<Vec<InputEvent>, String> {
+pub fn get_clip_input_events(file_path: String) -> Result<ClipInputData, String> {
     let path = PathBuf::from(&file_path);
     let contents = read_clip(&path).map_err(|e| e.to_string())?;
-    Ok(contents.input_events)
+    Ok(ClipInputData {
+        events: contents.input_events,
+        video_start_timestamp_us: contents.metadata.video_start_timestamp_us,
+    })
 }
 
 // --- Annotation Pipeline Commands ---
@@ -329,4 +342,53 @@ pub async fn export_clips(
         }
         _ => Err(format!("Unknown export format: {format}. Use 'json_sidecar' or 'huggingface'")),
     }
+}
+
+// --- Upload Pipeline Commands ---
+
+/// Upload clips to HuggingFace dataset.
+///
+/// Emits `upload-progress` events to the webview with UploadProgress payloads.
+/// Respects the cancel flag set by `cancel_upload`.
+#[tauri::command]
+pub async fn upload_clips(
+    app: tauri::AppHandle,
+    state: State<'_, EngineState>,
+    clip_paths: Vec<String>,
+) -> Result<u32, String> {
+    // Extract config and cancel flag while holding state, then drop it
+    let (config, cancel) = {
+        let settings = state.settings.lock().map_err(|e| e.to_string())?;
+        let config = settings.huggingface.clone();
+        let flag = state.upload_cancel.lock().map_err(|e| e.to_string())?;
+        flag.store(false, Ordering::SeqCst);
+        let cancel = Arc::clone(&flag);
+        (config, cancel)
+    }; // MutexGuards dropped here
+
+    let paths: Vec<PathBuf> = clip_paths.iter().map(PathBuf::from).collect();
+    let handle = app.clone();
+
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::upload::hf_client::upload_clips(
+            &config,
+            &paths,
+            cancel,
+            |progress: UploadProgress| {
+                let _ = handle.emit("upload-progress", &progress);
+            },
+        )
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Cancel an in-progress upload.
+#[tauri::command]
+pub fn cancel_upload(state: State<'_, EngineState>) -> Result<(), String> {
+    let flag = state.upload_cancel.lock().map_err(|e| e.to_string())?;
+    flag.store(true, Ordering::SeqCst);
+    info!("Upload cancellation requested");
+    Ok(())
 }

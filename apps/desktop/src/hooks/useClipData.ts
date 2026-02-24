@@ -21,17 +21,27 @@ interface ClipData {
   error: string | null;
 }
 
-function normalizeTimestamps(events: ClipInputEvent[]): ClipInputEvent[] {
+function normalizeTimestamps(
+  events: ClipInputEvent[],
+  videoStartTimestampUs: number,
+): ClipInputEvent[] {
   if (events.length === 0) return events;
 
-  const minTs = events.reduce(
-    (min, e) => Math.min(min, e.timestamp_us),
-    events[0].timestamp_us,
-  );
+  // Use the first video frame timestamp as the origin so input events
+  // align with video.currentTime (which starts at 0 = first frame).
+  // For old clips where videoStartTimestampUs is 0, fall back to the
+  // minimum input event timestamp (slightly imprecise but close enough).
+  const origin =
+    videoStartTimestampUs > 0
+      ? videoStartTimestampUs
+      : events.reduce(
+          (min, e) => Math.min(min, e.timestamp_us),
+          events[0].timestamp_us,
+        );
 
   return events.map((e) => ({
     ...e,
-    timestamp_us: e.timestamp_us - minTs,
+    timestamp_us: e.timestamp_us - origin,
   }));
 }
 
@@ -47,13 +57,19 @@ export function useClipData() {
     setData({ videoUrl: null, inputEvents: [], loading: true, error: null });
 
     try {
-      const [tempPath, rawEvents] = await Promise.all([
+      const [tempPath, clipInputData] = await Promise.all([
         invoke<string>("extract_clip_video", { filePath }),
-        invoke<ClipInputEvent[]>("get_clip_input_events", { filePath }),
+        invoke<{ events: ClipInputEvent[]; video_start_timestamp_us: number }>(
+          "get_clip_input_events",
+          { filePath },
+        ),
       ]);
 
       const videoUrl = convertFileSrc(tempPath);
-      const inputEvents = normalizeTimestamps(rawEvents);
+      const inputEvents = normalizeTimestamps(
+        clipInputData.events,
+        clipInputData.video_start_timestamp_us,
+      );
 
       setData({ videoUrl, inputEvents, loading: false, error: null });
     } catch (err) {

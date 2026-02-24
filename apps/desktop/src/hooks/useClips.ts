@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
 export interface ClipSummary {
@@ -23,6 +23,11 @@ export function useClips() {
   const [error, setError] = useState<string | null>(null);
 
   const fetchClips = useCallback(async () => {
+    if (!isTauri()) {
+      setLoading(false);
+      setError("Not running inside Tauri — clip IPC unavailable");
+      return;
+    }
     try {
       setLoading(true);
       setError(null);
@@ -37,6 +42,7 @@ export function useClips() {
 
   const deleteClip = useCallback(
     async (filePath: string) => {
+      if (!isTauri()) return;
       try {
         await invoke("delete_clip", { filePath });
         await fetchClips();
@@ -48,6 +54,7 @@ export function useClips() {
   );
 
   const saveClip = useCallback(async () => {
+    if (!isTauri()) return null;
     try {
       const path = await invoke<string>("save_clip");
       await fetchClips();
@@ -63,6 +70,8 @@ export function useClips() {
   }, [fetchClips]);
 
   useEffect(() => {
+    if (!isTauri()) return;
+
     const unlisten = listen("clip-saved", () => {
       fetchClips();
     }).catch((err) => {

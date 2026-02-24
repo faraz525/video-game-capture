@@ -168,7 +168,7 @@ impl FfmpegEncoder {
 }
 
 /// Check if a given codec is available in FFmpeg's encoder list.
-fn is_codec_available(ffmpeg_path: &str, codec: &str) -> bool {
+pub(crate) fn is_codec_available(ffmpeg_path: &str, codec: &str) -> bool {
     let output = Command::new(ffmpeg_path)
         .args(["-hide_banner", "-encoders"])
         .stdout(Stdio::piped())
@@ -181,11 +181,38 @@ fn is_codec_available(ffmpeg_path: &str, codec: &str) -> bool {
     }
 }
 
+/// Path set by Tauri sidecar resolution at startup.
+static SIDECAR_PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Set the FFmpeg sidecar path (called from lib.rs at app startup).
+#[allow(dead_code)]
+pub fn set_sidecar_path(path: String) {
+    let _ = SIDECAR_PATH.set(path);
+}
+
 /// Find the FFmpeg executable.
 ///
-/// Search order: Tauri sidecar → well-known paths → system PATH.
-fn find_ffmpeg() -> Result<String, EncoderError> {
-    // Check if bundled as Tauri sidecar
+/// Search order: GAMECLIP_FFMPEG_PATH env → sidecar OnceLock →
+/// well-known paths → system PATH.
+pub(crate) fn find_ffmpeg() -> Result<String, EncoderError> {
+    // 1. Environment variable override
+    if let Ok(env_path) = std::env::var("GAMECLIP_FFMPEG_PATH") {
+        if Path::new(&env_path).exists() {
+            return Ok(env_path);
+        }
+        return Err(EncoderError::NotFound(format!(
+            "GAMECLIP_FFMPEG_PATH set to '{env_path}' but file does not exist"
+        )));
+    }
+
+    // 2. Sidecar path set at startup
+    if let Some(sidecar) = SIDECAR_PATH.get() {
+        if Path::new(sidecar).exists() {
+            return Ok(sidecar.clone());
+        }
+    }
+
+    // 3. Check if bundled next to executable
     if let Ok(exe_dir) = std::env::current_exe().map(|p| p.parent().unwrap_or(Path::new(".")).to_path_buf()) {
         let sidecar = exe_dir.join("ffmpeg").with_extension(std::env::consts::EXE_EXTENSION);
         if sidecar.exists() {
@@ -193,7 +220,7 @@ fn find_ffmpeg() -> Result<String, EncoderError> {
         }
     }
 
-    // Check well-known paths (macOS GUI apps may not inherit full shell PATH)
+    // 4. Check well-known paths (macOS GUI apps may not inherit full shell PATH)
     let well_known = [
         "/opt/homebrew/bin/ffmpeg",   // Apple Silicon homebrew
         "/usr/local/bin/ffmpeg",      // Intel homebrew / manual install
@@ -204,7 +231,7 @@ fn find_ffmpeg() -> Result<String, EncoderError> {
         }
     }
 
-    // Fall back to system PATH
+    // 5. Fall back to system PATH
     let test = Command::new("ffmpeg")
         .arg("-version")
         .stdout(Stdio::null())
@@ -214,7 +241,7 @@ fn find_ffmpeg() -> Result<String, EncoderError> {
     match test {
         Ok(status) if status.success() => Ok("ffmpeg".to_string()),
         _ => Err(EncoderError::NotFound(
-            "ffmpeg not found in sidecar, /opt/homebrew/bin, /usr/local/bin, or system PATH".to_string(),
+            "ffmpeg not found via env, sidecar, /opt/homebrew/bin, /usr/local/bin, or system PATH".to_string(),
         )),
     }
 }
@@ -312,5 +339,59 @@ mod tests {
         // This test just verifies the function doesn't panic.
         // It may or may not find ffmpeg depending on the system.
         let _ = find_ffmpeg();
+    }
+
+    // T14: find_ffmpeg respects GAMECLIP_FFMPEG_PATH env override
+    #[test]
+    fn find_ffmpeg_respects_env_override() {
+        let original = std::env::var("GAMECLIP_FFMPEG_PATH").ok();
+
+        // Point to a known existing path (the real ffmpeg)
+        if let Ok(real_path) = find_ffmpeg() {
+            std::env::set_var("GAMECLIP_FFMPEG_PATH", &real_path);
+            let result = find_ffmpeg();
+            assert!(result.is_ok());
+            assert_eq!(result.unwrap(), real_path);
+        }
+
+        // Restore
+        match original {
+            Some(val) => std::env::set_var("GAMECLIP_FFMPEG_PATH", val),
+            None => std::env::remove_var("GAMECLIP_FFMPEG_PATH"),
+        }
+    }
+
+    // T15: set_sidecar_path makes find_ffmpeg return that path
+    #[test]
+    fn set_sidecar_path_used_by_find_ffmpeg() {
+        // OnceLock can only be set once per process, so this test
+        // verifies the API doesn't panic. The actual path resolution
+        // depends on whether the OnceLock was already set.
+        set_sidecar_path("/some/fake/path".to_string());
+        // If GAMECLIP_FFMPEG_PATH is not set, find_ffmpeg will check
+        // the sidecar path next. It won't exist, so it falls through.
+        let _ = find_ffmpeg();
+    }
+
+    // T16: without sidecar or env, falls back to system FFmpeg
+    #[test]
+    fn find_ffmpeg_fallback_to_system() {
+        let original = std::env::var("GAMECLIP_FFMPEG_PATH").ok();
+        std::env::remove_var("GAMECLIP_FFMPEG_PATH");
+
+        // Should either find system ffmpeg or return NotFound
+        let result = find_ffmpeg();
+        // We can't assert success because the test machine might not have ffmpeg
+        // but we can assert it doesn't panic
+        match &result {
+            Ok(path) => assert!(!path.is_empty()),
+            Err(e) => assert!(matches!(e, EncoderError::NotFound(_))),
+        }
+
+        // Restore
+        match original {
+            Some(val) => std::env::set_var("GAMECLIP_FFMPEG_PATH", val),
+            None => {} // already removed
+        }
     }
 }

@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Metadata for a saved game clip.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -34,10 +35,27 @@ pub struct ClipMetadata {
     /// Defaults to true for backwards compatibility with older clips.
     #[serde(default = "default_video_encoded")]
     pub video_encoded: bool,
+    /// Timestamp (in microseconds from SyncClock epoch) of the first video frame.
+    /// Used to align input event timestamps with video playback.
+    /// Defaults to 0 for clips saved before this field existed.
+    #[serde(default)]
+    pub video_start_timestamp_us: u64,
     /// Annotation layers present in this clip (e.g., "frame_actions", "quality").
     /// Empty for unannotated clips. Defaults to empty for backwards compatibility.
     #[serde(default)]
     pub annotation_layers: Vec<String>,
+    /// Format version. v1 = original, v2 = checksums added. Defaults to 1
+    /// for backwards compatibility with clips saved before this field existed.
+    #[serde(default = "default_format_version")]
+    pub format_version: u32,
+    /// SHA-256 checksums for each entry in the zip archive.
+    /// Empty for v1 clips. Defaults to empty HashMap for backwards compatibility.
+    #[serde(default)]
+    pub checksums: HashMap<String, String>,
+}
+
+fn default_format_version() -> u32 {
+    1
 }
 
 fn default_video_encoded() -> bool {
@@ -70,7 +88,10 @@ impl ClipMetadata {
             created_at: Utc::now(),
             devices: CaptureDevices::default(),
             video_encoded: true,
+            video_start_timestamp_us: 0,
             annotation_layers: Vec::new(),
+            format_version: 2,
+            checksums: HashMap::new(),
         }
     }
 }
@@ -100,7 +121,12 @@ mod tests {
                 controller: false,
             },
             video_encoded: true,
+            video_start_timestamp_us: 100_000,
             annotation_layers: vec!["frame_actions".to_string()],
+            format_version: 2,
+            checksums: HashMap::from([
+                ("video.bin".to_string(), "abc123".to_string()),
+            ]),
         };
 
         let json = serde_json::to_string_pretty(&meta).unwrap();
@@ -117,6 +143,8 @@ mod tests {
         assert_eq!(meta.duration_secs, 0.0);
         assert!(!meta.has_audio);
         assert!(!meta.devices.keyboard);
+        assert_eq!(meta.format_version, 2);
+        assert!(meta.checksums.is_empty());
     }
 
     #[test]
@@ -128,5 +156,49 @@ mod tests {
         assert!(json.contains("\"name\":\"My Clip\""));
         assert!(json.contains("\"width\":1920"));
         assert!(json.contains("\"created_at\""));
+        assert!(json.contains("\"format_version\":2"));
+    }
+
+    // T28: metadata without format_version defaults to 1
+    #[test]
+    fn metadata_without_format_version_defaults_to_1() {
+        let json = r#"{
+            "id": "test",
+            "name": "Test",
+            "width": 1920,
+            "height": 1080,
+            "fps": 60,
+            "duration_secs": 0.0,
+            "input_event_count": 0,
+            "has_audio": false,
+            "created_at": "2024-01-01T00:00:00Z",
+            "devices": {"keyboard": false, "mouse": false, "controller": false},
+            "video_encoded": true,
+            "video_start_timestamp_us": 0
+        }"#;
+        let meta: ClipMetadata = serde_json::from_str(json).unwrap();
+        assert_eq!(meta.format_version, 1);
+    }
+
+    // T29: metadata without checksums defaults to empty HashMap
+    #[test]
+    fn metadata_without_checksums_defaults_to_empty() {
+        let json = r#"{
+            "id": "test",
+            "name": "Test",
+            "width": 1920,
+            "height": 1080,
+            "fps": 60,
+            "duration_secs": 0.0,
+            "input_event_count": 0,
+            "has_audio": false,
+            "created_at": "2024-01-01T00:00:00Z",
+            "devices": {"keyboard": false, "mouse": false, "controller": false},
+            "video_encoded": true,
+            "video_start_timestamp_us": 0,
+            "format_version": 1
+        }"#;
+        let meta: ClipMetadata = serde_json::from_str(json).unwrap();
+        assert!(meta.checksums.is_empty());
     }
 }

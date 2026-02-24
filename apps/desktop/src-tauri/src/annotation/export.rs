@@ -503,7 +503,10 @@ mod tests {
                 controller: false,
             },
             video_encoded: false,
+            video_start_timestamp_us: 0,
             annotation_layers: Vec::new(),
+            format_version: 2,
+            checksums: std::collections::HashMap::new(),
         };
 
         let data = ClipPackageData {

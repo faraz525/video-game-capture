@@ -34,12 +34,21 @@ impl MockInputRecorder {
         let counter = self.event_counter;
         self.event_counter += 1;
 
-        let kind = match counter % 6 {
-            0 | 1 => {
-                let key_idx = (counter / 2) as usize % MOCK_KEYS.len();
+        let kind = match counter % 8 {
+            // Key down for primary movement key
+            0 => {
+                let key_idx = (counter / 8) as usize % MOCK_KEYS.len();
                 InputEventKind::Key(KeyEvent {
                     key: MOCK_KEYS[key_idx].to_string(),
-                    pressed: counter.is_multiple_of(2),
+                    pressed: true,
+                })
+            }
+            // Key down for a second concurrent key (simulates W+A, etc.)
+            1 => {
+                let key_idx = ((counter / 8) as usize + 1) % MOCK_KEYS.len();
+                InputEventKind::Key(KeyEvent {
+                    key: MOCK_KEYS[key_idx].to_string(),
+                    pressed: true,
                 })
             }
             2 => InputEventKind::MouseMove(MouseMoveEvent {
@@ -58,6 +67,23 @@ impl MockInputRecorder {
                 x: ((counter * 7) % 1920) as f64,
                 y: ((counter * 13) % 1080) as f64,
             }),
+            // Key up for second concurrent key
+            5 => {
+                let key_idx = ((counter / 8) as usize + 1) % MOCK_KEYS.len();
+                InputEventKind::Key(KeyEvent {
+                    key: MOCK_KEYS[key_idx].to_string(),
+                    pressed: false,
+                })
+            }
+            // Key up for primary movement key
+            6 => {
+                let key_idx = (counter / 8) as usize % MOCK_KEYS.len();
+                InputEventKind::Key(KeyEvent {
+                    key: MOCK_KEYS[key_idx].to_string(),
+                    pressed: false,
+                })
+            }
+            // Space tap (down only — released next cycle at slot 5/6)
             _ => InputEventKind::Key(KeyEvent {
                 key: "Space".to_string(),
                 pressed: true,
@@ -193,7 +219,7 @@ mod tests {
         let mut has_mouse_move = false;
         let mut has_mouse_button = false;
 
-        for _ in 0..6 {
+        for _ in 0..8 {
             let events = recorder.poll_events().unwrap();
             for event in events {
                 match event.kind {

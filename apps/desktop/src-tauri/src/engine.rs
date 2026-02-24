@@ -2,6 +2,7 @@ use crate::audio::AudioCapture;
 use crate::audio::AudioConfig;
 use crate::capture::{CaptureConfig, ScreenCapture};
 use crate::clip::saver::ClipSaver;
+use crate::clip::streaming::{FfmpegStreamingEncoder, StreamingConfig, StreamingEncoder};
 use crate::input::InputRecorder;
 use crate::sync::clock::SyncClock;
 use log::{error, info, warn};
@@ -19,6 +20,7 @@ pub struct EngineState {
     pub saver: Arc<Mutex<ClipSaver>>,
     pub running: Arc<AtomicBool>,
     pub settings: Mutex<AppSettings>,
+    pub upload_cancel: Mutex<Arc<AtomicBool>>,
 }
 
 /// User-configurable settings.
@@ -30,6 +32,9 @@ pub struct AppSettings {
     pub capture_fps: u32,
     pub capture_width: u32,
     pub capture_height: u32,
+    /// HuggingFace upload configuration.
+    #[serde(default)]
+    pub huggingface: crate::upload::hf_client::HuggingFaceConfig,
 }
 
 impl Default for AppSettings {
@@ -42,6 +47,7 @@ impl Default for AppSettings {
             capture_fps: 30,
             capture_width: 640,
             capture_height: 360,
+            huggingface: crate::upload::hf_client::HuggingFaceConfig::default(),
         }
     }
 }
@@ -108,6 +114,7 @@ pub fn create_engine_state() -> EngineState {
         saver: Arc::new(Mutex::new(saver)),
         running: Arc::new(AtomicBool::new(false)),
         settings: Mutex::new(settings),
+        upload_cancel: Mutex::new(Arc::new(AtomicBool::new(false))),
     }
 }
 
@@ -154,12 +161,76 @@ pub fn start_capture(state: &EngineState) -> Result<(), Box<dyn std::error::Erro
             return;
         }
 
-        info!("Capture engine started ({}x{} @ {}fps)", settings.capture_width, settings.capture_height, settings.capture_fps);
+        // Try to start streaming encoder for in-capture encoding
+        let mut streaming_encoder: Option<Box<dyn StreamingEncoder>> = None;
+        {
+            let mut enc = FfmpegStreamingEncoder::new();
+            let streaming_config = StreamingConfig {
+                width: settings.capture_width,
+                height: settings.capture_height,
+                fps: settings.capture_fps,
+            };
+            match enc.start(streaming_config) {
+                Ok(()) => {
+                    info!("Streaming encoder active — frames will be encoded in real-time");
+                    // Enable encoded buffer in saver
+                    let mut s = lock_or_recover(&saver);
+                    s.enable_encoded_buffer(settings.buffer_duration_secs);
+                    streaming_encoder = Some(Box::new(enc));
+                }
+                Err(e) => {
+                    warn!("Streaming encoder unavailable, falling back to raw buffer: {e}");
+                }
+            }
+        }
+
+        info!(
+            "Capture engine started ({}x{} @ {}fps, streaming={})",
+            settings.capture_width,
+            settings.capture_height,
+            settings.capture_fps,
+            streaming_encoder.is_some()
+        );
 
         while running.load(Ordering::Relaxed) {
+            // Collect encoded chunks outside the lock to batch the push
+            let mut pending_chunks = Vec::new();
+
             if let Ok(Some(frame)) = screen.poll_frame() {
-                let mut s = lock_or_recover(&saver);
-                s.push_frame(frame);
+                // Feed frame to streaming encoder if available
+                if let Some(ref mut enc) = streaming_encoder {
+                    if let Err(e) = enc.push_frame(&frame) {
+                        warn!("Streaming encoder push failed: {e}");
+                    }
+
+                    // Poll all available encoded chunks
+                    while let Ok(Some(chunk)) = enc.poll_chunk() {
+                        pending_chunks.push(chunk);
+                    }
+
+                    // Single lock acquisition for frame cache + encoded chunks
+                    let mut s = lock_or_recover(&saver);
+                    // Cache first raw frame for thumbnail (buffer handles dedup)
+                    s.cache_first_raw_frame(frame.clone());
+                    for chunk in pending_chunks.drain(..) {
+                        s.push_encoded_chunk(chunk);
+                    }
+                } else {
+                    // No streaming encoder — use raw frame buffer
+                    let mut s = lock_or_recover(&saver);
+                    s.push_frame(frame);
+                }
+            } else if let Some(ref mut enc) = streaming_encoder {
+                // No frame this tick, but still poll for encoded chunks
+                while let Ok(Some(chunk)) = enc.poll_chunk() {
+                    pending_chunks.push(chunk);
+                }
+                if !pending_chunks.is_empty() {
+                    let mut s = lock_or_recover(&saver);
+                    for chunk in pending_chunks {
+                        s.push_encoded_chunk(chunk);
+                    }
+                }
             }
 
             if let Ok(events) = input.poll_events() {
@@ -180,6 +251,11 @@ pub fn start_capture(state: &EngineState) -> Result<(), Box<dyn std::error::Erro
         }
 
         // Clean shutdown
+        if let Some(mut enc) = streaming_encoder {
+            if let Err(e) = enc.stop() {
+                warn!("Error stopping streaming encoder: {e}");
+            }
+        }
         let _ = screen.stop();
         let _ = input.stop();
         let _ = audio.stop();
@@ -205,19 +281,34 @@ fn lock_or_recover(saver: &Arc<Mutex<ClipSaver>>) -> std::sync::MutexGuard<'_, C
 /// Takes an `Arc<Mutex<ClipSaver>>` directly so callers can clone it and
 /// spawn this on a background thread without holding a reference to EngineState.
 pub fn save_clip(saver: &Arc<Mutex<ClipSaver>>) -> Result<PathBuf, String> {
-    let (frames, input_events, audio_buffers, save_dir) = {
+    let (frames, input_events, audio_buffers, encoded_video, save_dir) = {
         let mut s = lock_or_recover(saver);
         let frames = s.frames.drain();
         let input_events = s.input_events.drain();
         let audio_buffers = s.audio_buffers.drain();
         let save_dir = s.save_dir().to_path_buf();
-        (frames, input_events, audio_buffers, save_dir)
+
+        // Drain encoded video data if streaming encoder was active
+        let encoded_video = s.encoded_chunks.as_mut().map(|buf| {
+            let video_data = buf.drain_as_fmp4();
+            let first_frame = buf.take_first_frame();
+            (video_data, first_frame)
+        });
+
+        (frames, input_events, audio_buffers, encoded_video, save_dir)
     };
     // Lock released here — capture thread resumes immediately
 
     let game_name = detect_current_game();
-    ClipSaver::save_clip_from_data(frames, input_events, audio_buffers, game_name, &save_dir)
-        .map_err(|e| e.to_string())
+    ClipSaver::save_clip_from_data(
+        frames,
+        input_events,
+        audio_buffers,
+        encoded_video,
+        game_name,
+        &save_dir,
+    )
+    .map_err(|e| e.to_string())
 }
 
 /// Detect the currently running game (if any).
