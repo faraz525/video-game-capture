@@ -45,8 +45,8 @@ impl Default for AppSettings {
             save_directory: save_dir,
             hotkey: "Ctrl+Shift+R".to_string(),
             capture_fps: 30,
-            capture_width: 640,
-            capture_height: 360,
+            capture_width: 1920,
+            capture_height: 1080,
             huggingface: crate::upload::hf_client::HuggingFaceConfig::default(),
         }
     }

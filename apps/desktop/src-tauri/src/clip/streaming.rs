@@ -50,6 +50,10 @@ pub struct FfmpegStreamingEncoder {
     child: Option<Child>,
     chunk_rx: Option<mpsc::Receiver<EncodedChunk>>,
     reader_handle: Option<thread::JoinHandle<()>>,
+    /// Dedicated writer thread that performs blocking stdin writes off the capture loop.
+    writer_handle: Option<thread::JoinHandle<()>>,
+    /// Bounded channel to send frame data to the writer thread without blocking.
+    frame_tx: Option<mpsc::SyncSender<Vec<u8>>>,
     frame_count: u64,
 }
 
@@ -59,6 +63,8 @@ impl FfmpegStreamingEncoder {
             child: None,
             chunk_rx: None,
             reader_handle: None,
+            writer_handle: None,
+            frame_tx: None,
             frame_count: 0,
         }
     }
@@ -88,11 +94,39 @@ impl StreamingEncoder for FfmpegStreamingEncoder {
                 codec,
                 codec_args,
             ) {
-                Ok((child, chunk_rx, reader_handle)) => {
+                Ok((mut child, chunk_rx, reader_handle)) => {
                     info!("Streaming encoder started with codec: {codec}");
+
+                    // Take stdin for a dedicated writer thread. At 1080p each
+                    // frame is ~8MB; blocking write_all on the capture loop
+                    // stalls it long enough for ScreenCaptureKit to drop frames.
+                    let stdin = child.stdin.take().ok_or_else(|| {
+                        StreamingEncoderError::Process("stdin not available".into())
+                    })?;
+
+                    const FRAME_CHANNEL_CAPACITY: usize = 4;
+                    let (frame_tx, frame_rx) =
+                        mpsc::sync_channel::<Vec<u8>>(FRAME_CHANNEL_CAPACITY);
+
+                    let writer_handle = thread::spawn(move || {
+                        let mut stdin = stdin;
+                        while let Ok(frame_data) = frame_rx.recv() {
+                            if let Err(e) = stdin.write_all(&frame_data) {
+                                if e.kind() == std::io::ErrorKind::BrokenPipe {
+                                    info!("Streaming encoder: stdin pipe closed");
+                                } else {
+                                    warn!("Streaming encoder: write error: {e}");
+                                }
+                                break;
+                            }
+                        }
+                    });
+
                     self.child = Some(child);
                     self.chunk_rx = Some(chunk_rx);
                     self.reader_handle = Some(reader_handle);
+                    self.writer_handle = Some(writer_handle);
+                    self.frame_tx = Some(frame_tx);
                     self.frame_count = 0;
                     return Ok(());
                 }
@@ -109,22 +143,28 @@ impl StreamingEncoder for FfmpegStreamingEncoder {
     }
 
     fn push_frame(&mut self, frame: &CapturedFrame) -> Result<(), StreamingEncoderError> {
-        let child = self.child.as_mut().ok_or(StreamingEncoderError::NotRunning)?;
-        let stdin = child
-            .stdin
-            .as_mut()
-            .ok_or_else(|| StreamingEncoderError::Process("stdin closed".to_string()))?;
+        let tx = self
+            .frame_tx
+            .as_ref()
+            .ok_or(StreamingEncoderError::NotRunning)?;
 
-        if let Err(e) = stdin.write_all(&frame.data) {
-            if e.kind() == std::io::ErrorKind::BrokenPipe {
-                warn!("Streaming encoder pipe broken at frame {}", self.frame_count);
-                return Err(StreamingEncoderError::Process("pipe broken".to_string()));
+        match tx.try_send(frame.data.clone()) {
+            Ok(()) => {
+                self.frame_count += 1;
+                Ok(())
             }
-            return Err(StreamingEncoderError::Io(e));
+            Err(mpsc::TrySendError::Full(_)) => {
+                warn!(
+                    "Streaming encoder: frame {} dropped (backpressure)",
+                    self.frame_count
+                );
+                self.frame_count += 1;
+                Ok(())
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => Err(
+                StreamingEncoderError::Process("encoder writer thread exited".into()),
+            ),
         }
-
-        self.frame_count += 1;
-        Ok(())
     }
 
     fn poll_chunk(&mut self) -> Result<Option<EncodedChunk>, StreamingEncoderError> {
@@ -137,11 +177,16 @@ impl StreamingEncoder for FfmpegStreamingEncoder {
     }
 
     fn stop(&mut self) -> Result<(), StreamingEncoderError> {
-        if let Some(mut child) = self.child.take() {
-            // Close stdin to signal EOF to FFmpeg
-            drop(child.stdin.take());
+        // 1. Drop frame sender → writer thread's recv() returns Err → it exits
+        self.frame_tx.take();
 
-            // Wait for the process to finish with timeout
+        // 2. Join writer thread → its stdin drop signals EOF to FFmpeg
+        if let Some(handle) = self.writer_handle.take() {
+            let _ = handle.join();
+        }
+
+        // 3. Wait for FFmpeg process to finish encoding remaining data
+        if let Some(mut child) = self.child.take() {
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             loop {
                 match child.try_wait() {
@@ -166,13 +211,12 @@ impl StreamingEncoder for FfmpegStreamingEncoder {
             }
         }
 
-        // Wait for reader thread to finish
+        // 4. Join reader thread
         if let Some(handle) = self.reader_handle.take() {
             let _ = handle.join();
         }
 
         // Keep chunk_rx alive so callers can drain remaining chunks after stop.
-        // It will be replaced on the next start().
         self.frame_count = 0;
         info!("Streaming encoder stopped");
         Ok(())
@@ -580,7 +624,24 @@ mod tests {
             }
         }
 
+        // Stop flushes remaining frames; drain chunks that arrived after
+        // the push loop (writer thread adds latency).
         encoder.stop().unwrap();
+        while let Ok(Some(chunk)) = encoder.poll_chunk() {
+            if chunk.chunk_type == ChunkType::InitSegment {
+                assert!(
+                    chunk.data.len() >= 8,
+                    "init segment too small: {} bytes",
+                    chunk.data.len()
+                );
+                assert_eq!(
+                    &chunk.data[4..8],
+                    b"ftyp",
+                    "init segment should start with ftyp box"
+                );
+                got_init = true;
+            }
+        }
         assert!(got_init, "should have received an init segment");
     }
 
