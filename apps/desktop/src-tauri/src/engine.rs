@@ -1,7 +1,7 @@
 use crate::audio::AudioCapture;
 use crate::audio::AudioConfig;
-use crate::capture::{CaptureConfig, ScreenCapture};
-use crate::clip::saver::ClipSaver;
+use crate::capture::{CaptureConfig, CapturedFrame, ScreenCapture};
+use crate::clip::saver::{ClipSaver, EncodedVideoData};
 use crate::clip::streaming::{FfmpegStreamingEncoder, StreamingConfig, StreamingEncoder};
 use crate::input::InputRecorder;
 use crate::sync::clock::SyncClock;
@@ -150,11 +150,14 @@ pub fn start_capture(state: &EngineState) -> Result<(), Box<dyn std::error::Erro
             running.store(false, Ordering::SeqCst);
             return;
         }
-        if let Err(e) = input.start() {
-            error!("Failed to start input recorder: {e}");
-            running.store(false, Ordering::SeqCst);
-            return;
-        }
+        // Input recorder failure is non-fatal — capture continues without input overlay
+        let input_active = match input.start() {
+            Ok(()) => true,
+            Err(e) => {
+                warn!("Input recorder unavailable, continuing without input capture: {e}");
+                false
+            }
+        };
         if let Err(e) = audio.start(audio_config) {
             error!("Failed to start audio capture: {e}");
             running.store(false, Ordering::SeqCst);
@@ -173,9 +176,16 @@ pub fn start_capture(state: &EngineState) -> Result<(), Box<dyn std::error::Erro
             match enc.start(streaming_config) {
                 Ok(()) => {
                     info!("Streaming encoder active — frames will be encoded in real-time");
+                    let gop_frames = settings.capture_fps * crate::clip::streaming::GOP_MULTIPLIER;
+                    let fragment_duration_us =
+                        (gop_frames as u64 * 1_000_000) / settings.capture_fps as u64;
                     // Enable encoded buffer in saver
                     let mut s = lock_or_recover(&saver);
-                    s.enable_encoded_buffer(settings.buffer_duration_secs);
+                    s.enable_encoded_buffer(
+                        settings.buffer_duration_secs,
+                        fragment_duration_us,
+                        settings.capture_fps,
+                    );
                     streaming_encoder = Some(Box::new(enc));
                 }
                 Err(e) => {
@@ -184,60 +194,178 @@ pub fn start_capture(state: &EngineState) -> Result<(), Box<dyn std::error::Erro
             }
         }
 
+        // Track the first frame's SyncClock timestamp for offsetting
+        // synthetic chunk timestamps from the streaming encoder.
+        let mut encoder_ts_offset: Option<u64> = None;
+
+        // Frame pacing state: ensures the encoder receives frames at the
+        // target rate. ScreenCaptureKit may deliver fewer frames than
+        // configured (e.g., ~10-15fps for static desktop content), but
+        // FFmpeg's `-r fps` input flag assumes each raw frame is exactly
+        // 1/fps seconds apart. Without pacing, lower capture rates cause
+        // the video to play faster than real-time (2x for half-rate).
+        let frame_interval_us = 1_000_000u64 / settings.capture_fps as u64;
+        let mut last_captured_frame: Option<CapturedFrame> = None;
+        let mut next_encoder_push_us: Option<u64> = None;
+        // Burst cap: max frames pushed in one iteration to avoid overwhelming
+        // the encoder after pauses. Allows recovery from ~200ms gaps.
+        let max_burst = (settings.capture_fps / 5).max(2) as u64;
+
+        // Capture diagnostics: logged every 10 seconds
+        let mut stats_capture_count: u64 = 0;
+        let mut stats_push_count: u64 = 0;
+        let mut stats_dup_count: u64 = 0;
+        let mut last_stats_us: u64 = 0;
+        const STATS_INTERVAL_US: u64 = 10_000_000;
+
         info!(
-            "Capture engine started ({}x{} @ {}fps, streaming={})",
+            "Capture engine started ({}x{} @ {}fps, streaming={}, frame_interval={}us)",
             settings.capture_width,
             settings.capture_height,
             settings.capture_fps,
-            streaming_encoder.is_some()
+            streaming_encoder.is_some(),
+            frame_interval_us,
         );
 
         while running.load(Ordering::Relaxed) {
-            // Collect encoded chunks outside the lock to batch the push
+            let now_us = clock.now_us();
             let mut pending_chunks = Vec::new();
+            let mut encoder_dead = false;
 
-            if let Ok(Some(frame)) = screen.poll_frame() {
-                // Feed frame to streaming encoder if available
-                if let Some(ref mut enc) = streaming_encoder {
-                    if let Err(e) = enc.push_frame(&frame) {
-                        warn!("Streaming encoder push failed: {e}");
-                    }
-
-                    // Poll all available encoded chunks
-                    while let Ok(Some(chunk)) = enc.poll_chunk() {
-                        pending_chunks.push(chunk);
-                    }
-
-                    // Single lock acquisition for frame cache + encoded chunks
-                    let mut s = lock_or_recover(&saver);
-                    // Cache first raw frame for thumbnail (buffer handles dedup)
-                    s.cache_first_raw_frame(frame.clone());
-                    for chunk in pending_chunks.drain(..) {
-                        s.push_encoded_chunk(chunk);
-                    }
-                } else {
-                    // No streaming encoder — use raw frame buffer
-                    let mut s = lock_or_recover(&saver);
-                    s.push_frame(frame);
-                }
-            } else if let Some(ref mut enc) = streaming_encoder {
-                // No frame this tick, but still poll for encoded chunks
-                while let Ok(Some(chunk)) = enc.poll_chunk() {
-                    pending_chunks.push(chunk);
-                }
-                if !pending_chunks.is_empty() {
-                    let mut s = lock_or_recover(&saver);
-                    for chunk in pending_chunks {
-                        s.push_encoded_chunk(chunk);
-                    }
-                }
+            // Step 1: Poll for new capture frame (single poll per iteration)
+            let new_frame = screen.poll_frame().ok().flatten();
+            let got_new_frame = new_frame.is_some();
+            if got_new_frame {
+                stats_capture_count += 1;
             }
 
-            if let Ok(events) = input.poll_events() {
-                if !events.is_empty() {
-                    let mut s = lock_or_recover(&saver);
-                    for event in events {
-                        s.push_input(event);
+            // Step 2: Feed frames to streaming encoder on schedule
+            if streaming_encoder.is_some() {
+                // Store new frame for pacing (encoder path keeps last frame
+                // for duplication when capture rate < target fps)
+                if let Some(frame) = new_frame {
+                    last_captured_frame = Some(frame);
+                }
+
+                // Scoped borrow: use enc for push + poll, release before
+                // potential take() in the encoder_dead branch below.
+                if let Some(ref mut enc) = streaming_encoder {
+                    if let Some(ref frame) = last_captured_frame {
+                        // Initialize schedule on first frame
+                        if next_encoder_push_us.is_none() {
+                            next_encoder_push_us = Some(now_us);
+                        }
+
+                        // If schedule drifted more than 1 second behind (e.g.,
+                        // system pause), reset to avoid a burst of catch-up frames
+                        // that would just get dropped by encoder backpressure.
+                        if next_encoder_push_us
+                            .is_some_and(|due| now_us.saturating_sub(due) > 1_000_000)
+                        {
+                            warn!(
+                                "Frame schedule drifted >1s behind, resetting (was {}us behind)",
+                                now_us.saturating_sub(
+                                    next_encoder_push_us.unwrap_or(now_us)
+                                )
+                            );
+                            next_encoder_push_us = Some(now_us);
+                        }
+
+                        // Push frames to maintain target fps
+                        let mut pushes = 0u64;
+                        while next_encoder_push_us.is_some_and(|due| due <= now_us)
+                            && pushes < max_burst
+                        {
+                            if let Err(e) = enc.push_frame(frame) {
+                                warn!("Streaming encoder push failed: {e}");
+                                encoder_dead = true;
+                                break;
+                            }
+                            pushes += 1;
+                            stats_push_count += 1;
+                            if pushes > 1 || !got_new_frame {
+                                stats_dup_count += 1;
+                            }
+                            next_encoder_push_us =
+                                next_encoder_push_us.map(|d| d + frame_interval_us);
+                        }
+
+                        if !encoder_dead && encoder_ts_offset.is_none() {
+                            encoder_ts_offset = enc.first_frame_timestamp_us();
+                        }
+                    }
+
+                    // Poll all available encoded chunks and offset timestamps
+                    if !encoder_dead {
+                        loop {
+                            match enc.poll_chunk() {
+                                Ok(Some(mut chunk)) => {
+                                    if let Some(offset) = encoder_ts_offset {
+                                        chunk.timestamp_us =
+                                            chunk.timestamp_us.saturating_add(offset);
+                                    }
+                                    pending_chunks.push(chunk);
+                                }
+                                Ok(None) => break,
+                                Err(e) => {
+                                    warn!("Streaming encoder poll failed: {e}");
+                                    encoder_dead = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                // enc borrow released here
+
+                if encoder_dead {
+                    // Encoder died: clean up and clear stale data
+                    warn!("Streaming encoder died, falling back to raw frame buffer");
+                    if let Some(mut dead_enc) = streaming_encoder.take() {
+                        if let Err(e) = dead_enc.stop() {
+                            warn!("Error stopping dead encoder: {e}");
+                        }
+                    }
+                    encoder_ts_offset = None;
+                    next_encoder_push_us = None;
+                    {
+                        let mut s = lock_or_recover(&saver);
+                        if let Some(ref mut buf) = s.encoded_chunks {
+                            buf.clear();
+                        }
+                        // Push current frame to raw buffer as fallback
+                        if let Some(frame) = last_captured_frame.take() {
+                            s.push_frame(frame);
+                        }
+                    }
+                } else {
+                    // Cache thumbnail on new frames, push encoded chunks
+                    let needs_lock = got_new_frame || !pending_chunks.is_empty();
+                    if needs_lock {
+                        let mut s = lock_or_recover(&saver);
+                        if got_new_frame {
+                            if let Some(ref frame) = last_captured_frame {
+                                s.cache_first_raw_frame(frame.clone());
+                            }
+                        }
+                        for chunk in pending_chunks.drain(..) {
+                            s.push_encoded_chunk(chunk);
+                        }
+                    }
+                }
+            } else if let Some(frame) = new_frame {
+                // No streaming encoder — push new frame directly to raw buffer
+                let mut s = lock_or_recover(&saver);
+                s.push_frame(frame);
+            }
+
+            if input_active {
+                if let Ok(events) = input.poll_events() {
+                    if !events.is_empty() {
+                        let mut s = lock_or_recover(&saver);
+                        for event in events {
+                            s.push_input(event);
+                        }
                     }
                 }
             }
@@ -247,18 +375,49 @@ pub fn start_capture(state: &EngineState) -> Result<(), Box<dyn std::error::Erro
                 s.push_audio(buffer);
             }
 
+            // Periodic capture rate diagnostics
+            if now_us.saturating_sub(last_stats_us) >= STATS_INTERVAL_US && last_stats_us > 0 {
+                let elapsed = (now_us - last_stats_us) as f64 / 1_000_000.0;
+                info!(
+                    "Capture stats: capture={:.1}fps, encoder_push={:.1}fps (target={}fps), \
+                     duplicated={} frames ({:.0}%)",
+                    stats_capture_count as f64 / elapsed,
+                    stats_push_count as f64 / elapsed,
+                    settings.capture_fps,
+                    stats_dup_count,
+                    if stats_push_count > 0 {
+                        stats_dup_count as f64 / stats_push_count as f64 * 100.0
+                    } else {
+                        0.0
+                    },
+                );
+                stats_capture_count = 0;
+                stats_push_count = 0;
+                stats_dup_count = 0;
+                last_stats_us = now_us;
+            } else if last_stats_us == 0 {
+                last_stats_us = now_us;
+            }
+
             thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
         }
 
-        // Clean shutdown
+        // Clean shutdown — log session stats
         if let Some(mut enc) = streaming_encoder {
+            let dropped = enc.dropped_frame_count();
+            if dropped > 0 {
+                warn!("Capture session: {dropped} frames dropped due to encoder backpressure");
+            }
             if let Err(e) = enc.stop() {
                 warn!("Error stopping streaming encoder: {e}");
             }
         }
         let _ = screen.stop();
-        let _ = input.stop();
+        if input_active {
+            let _ = input.stop();
+        }
         let _ = audio.stop();
+        info!("Capture engine stopped");
     });
 
     Ok(())
@@ -289,10 +448,17 @@ pub fn save_clip(saver: &Arc<Mutex<ClipSaver>>) -> Result<PathBuf, String> {
         let save_dir = s.save_dir().to_path_buf();
 
         // Drain encoded video data if streaming encoder was active
+        let encoding_fps = s.encoding_fps();
         let encoded_video = s.encoded_chunks.as_mut().map(|buf| {
+            let time_span = buf.time_span_us();
             let video_data = buf.drain_as_fmp4();
             let first_frame = buf.take_first_frame();
-            (video_data, first_frame)
+            EncodedVideoData {
+                fmp4_bytes: video_data,
+                first_frame,
+                time_span_us: time_span,
+                encoding_fps,
+            }
         });
 
         (frames, input_events, audio_buffers, encoded_video, save_dir)

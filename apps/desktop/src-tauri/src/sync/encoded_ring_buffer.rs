@@ -38,16 +38,22 @@ pub struct EncodedRingBuffer {
     init_segment: Option<Vec<u8>>,
     chunks: VecDeque<EncodedChunk>,
     max_duration_us: u64,
+    fragment_duration_us: u64,
     first_raw_frame: Option<CapturedFrame>,
 }
 
 impl EncodedRingBuffer {
     /// Create a new buffer that retains at most `max_duration_us` of media chunks.
-    pub fn new(max_duration_us: u64) -> Self {
+    ///
+    /// `fragment_duration_us` is the duration of each encoded fragment (typically
+    /// `GOP_MULTIPLIER * 1_000_000` seconds). Used by `time_span_us()` to compute
+    /// the correct end time of the last chunk.
+    pub fn new(max_duration_us: u64, fragment_duration_us: u64) -> Self {
         Self {
             init_segment: None,
             chunks: VecDeque::new(),
             max_duration_us,
+            fragment_duration_us,
             first_raw_frame: None,
         }
     }
@@ -89,13 +95,25 @@ impl EncodedRingBuffer {
         self.first_raw_frame.take()
     }
 
+    /// Returns the time span of media chunks as `(first_ts, end_ts)` in microseconds.
+    ///
+    /// `end_ts` includes the duration of the last fragment, so the returned span
+    /// represents the full playback window. Returns `None` if there are no media chunks.
+    pub fn time_span_us(&self) -> Option<(u64, u64)> {
+        let first = self.chunks.front()?.timestamp_us;
+        let last = self.chunks.back()?.timestamp_us;
+        Some((first, last.saturating_add(self.fragment_duration_us)))
+    }
+
     /// Drain the buffer as a valid fragmented MP4 byte stream.
     ///
     /// Returns init_segment + all media chunks concatenated. The buffer
-    /// is emptied after this call.
+    /// is emptied after this call. Returns empty `Vec` if no init segment
+    /// has been received (media-only bytes are invalid fMP4).
     pub fn drain_as_fmp4(&mut self) -> Vec<u8> {
-        // Don't return init-only data with no media content
-        if self.chunks.is_empty() {
+        // Guard: need both init segment and media chunks for valid fMP4
+        if self.chunks.is_empty() || self.init_segment.is_none() {
+            self.chunks.clear();
             return Vec::new();
         }
 
@@ -110,6 +128,17 @@ impl EncodedRingBuffer {
         }
 
         out
+    }
+
+    /// Clear all buffered data (init segment, media chunks, and cached frame).
+    ///
+    /// Used when the streaming encoder dies mid-session to discard stale chunks
+    /// that would otherwise be paired with newer input events from a different
+    /// time window.
+    pub fn clear(&mut self) {
+        self.init_segment = None;
+        self.chunks.clear();
+        self.first_raw_frame = None;
     }
 
     /// Returns the number of media chunks in the buffer.
@@ -163,7 +192,7 @@ mod tests {
     // T1: drain empty returns empty vec
     #[test]
     fn drain_empty_returns_empty_vec() {
-        let mut buf = EncodedRingBuffer::new(30_000_000);
+        let mut buf = EncodedRingBuffer::new(30_000_000, 2_000_000);
         let result = buf.drain_as_fmp4();
         assert!(result.is_empty());
     }
@@ -171,7 +200,7 @@ mod tests {
     // T2: init segment prepended to drain output
     #[test]
     fn init_segment_prepended_to_drain_output() {
-        let mut buf = EncodedRingBuffer::new(30_000_000);
+        let mut buf = EncodedRingBuffer::new(30_000_000, 2_000_000);
         let init = make_init_chunk();
         let init_data = init.data.clone();
         buf.push(init);
@@ -188,7 +217,7 @@ mod tests {
     // T3: eviction preserves init segment, removes old media
     #[test]
     fn eviction_preserves_init_segment_removes_old_media() {
-        let mut buf = EncodedRingBuffer::new(1_000_000); // 1 second
+        let mut buf = EncodedRingBuffer::new(1_000_000, 2_000_000); // 1 second
 
         buf.push(make_init_chunk());
         buf.push(make_media_chunk(0));
@@ -209,7 +238,7 @@ mod tests {
     // T4: cache/take first frame roundtrip
     #[test]
     fn cache_take_first_frame_roundtrip() {
-        let mut buf = EncodedRingBuffer::new(30_000_000);
+        let mut buf = EncodedRingBuffer::new(30_000_000, 2_000_000);
         let frame = make_raw_frame(1000);
         buf.cache_first_frame(frame.clone());
 
@@ -224,7 +253,7 @@ mod tests {
     // T5: take first frame before cache returns None
     #[test]
     fn take_first_frame_before_cache_returns_none() {
-        let mut buf = EncodedRingBuffer::new(30_000_000);
+        let mut buf = EncodedRingBuffer::new(30_000_000, 2_000_000);
         assert!(buf.take_first_frame().is_none());
     }
 
@@ -242,7 +271,7 @@ mod tests {
     // Additional: cache_first_frame only stores first call
     #[test]
     fn cache_first_frame_only_stores_first() {
-        let mut buf = EncodedRingBuffer::new(30_000_000);
+        let mut buf = EncodedRingBuffer::new(30_000_000, 2_000_000);
         buf.cache_first_frame(make_raw_frame(1000));
         buf.cache_first_frame(make_raw_frame(2000)); // should be ignored
 
@@ -250,10 +279,90 @@ mod tests {
         assert_eq!(taken.timestamp_us, 1000);
     }
 
+    // time_span_us returns None when empty
+    #[test]
+    fn time_span_empty_returns_none() {
+        let buf = EncodedRingBuffer::new(30_000_000, 2_000_000);
+        assert!(buf.time_span_us().is_none());
+    }
+
+    // time_span_us returns first timestamp and end of last fragment
+    #[test]
+    fn time_span_returns_first_and_end_of_last() {
+        let mut buf = EncodedRingBuffer::new(30_000_000, 2_000_000);
+        buf.push(make_init_chunk());
+        buf.push(make_media_chunk(1_000_000));
+        buf.push(make_media_chunk(5_000_000));
+        buf.push(make_media_chunk(10_000_000));
+
+        let (first, end) = buf.time_span_us().unwrap();
+        assert_eq!(first, 1_000_000);
+        // end = last_chunk_ts (10M) + fragment_duration (2M)
+        assert_eq!(end, 12_000_000);
+    }
+
+    // time_span_us with single chunk returns start and end of that fragment
+    #[test]
+    fn time_span_single_chunk() {
+        let mut buf = EncodedRingBuffer::new(30_000_000, 2_000_000);
+        buf.push(make_media_chunk(3_000_000));
+
+        let (first, end) = buf.time_span_us().unwrap();
+        assert_eq!(first, 3_000_000);
+        // end = chunk_ts (3M) + fragment_duration (2M)
+        assert_eq!(end, 5_000_000);
+    }
+
+    // time_span_us with 6 chunks at 2s intervals gives 12s total (not 10s)
+    #[test]
+    fn time_span_includes_last_fragment_duration() {
+        let mut buf = EncodedRingBuffer::new(30_000_000, 2_000_000);
+        buf.push(make_init_chunk());
+        for i in 0..6 {
+            buf.push(make_media_chunk(i * 2_000_000));
+        }
+
+        let (first, end) = buf.time_span_us().unwrap();
+        assert_eq!(first, 0);
+        // 6 chunks: 0, 2M, 4M, 6M, 8M, 10M. Last ends at 10M + 2M = 12M
+        assert_eq!(end, 12_000_000);
+        assert_eq!(end - first, 12_000_000); // 12 seconds total
+    }
+
+    // clear resets all state
+    #[test]
+    fn clear_resets_all_state() {
+        let mut buf = EncodedRingBuffer::new(30_000_000, 2_000_000);
+        buf.push(make_init_chunk());
+        buf.push(make_media_chunk(1_000_000));
+        buf.push(make_media_chunk(2_000_000));
+        buf.cache_first_frame(make_raw_frame(1000));
+
+        buf.clear();
+
+        assert!(buf.is_empty());
+        assert!(!buf.has_init_segment());
+        assert!(buf.take_first_frame().is_none());
+        assert!(buf.time_span_us().is_none());
+    }
+
+    // drain returns empty when no init segment (media-only is invalid fMP4)
+    #[test]
+    fn drain_returns_empty_when_no_init_segment() {
+        let mut buf = EncodedRingBuffer::new(30_000_000, 2_000_000);
+        buf.push(make_media_chunk(1_000_000));
+        buf.push(make_media_chunk(2_000_000));
+
+        let result = buf.drain_as_fmp4();
+        assert!(result.is_empty());
+        // Chunks should be cleared even though we returned empty
+        assert!(buf.is_empty());
+    }
+
     // Additional: drain clears media chunks but preserves init segment ref
     #[test]
     fn drain_clears_media_chunks() {
-        let mut buf = EncodedRingBuffer::new(30_000_000);
+        let mut buf = EncodedRingBuffer::new(30_000_000, 2_000_000);
         buf.push(make_init_chunk());
         buf.push(make_media_chunk(1_000_000));
         buf.push(make_media_chunk(2_000_000));

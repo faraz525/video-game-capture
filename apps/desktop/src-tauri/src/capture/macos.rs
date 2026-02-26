@@ -4,7 +4,6 @@ use log::{error, info, warn};
 use screencapturekit::prelude::*;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
 const MAX_BUFFERED_FRAMES: usize = 10;
 
@@ -20,7 +19,6 @@ pub struct MacOSCapture {
     running: bool,
     stream: Option<SendableStream>,
     frame_buffer: Arc<Mutex<VecDeque<CapturedFrame>>>,
-    last_frame_time: Option<Instant>,
 }
 
 /// Wrapper to make SCStream sendable across threads.
@@ -126,7 +124,6 @@ impl MacOSCapture {
             running: false,
             stream: None,
             frame_buffer: Arc::new(Mutex::new(VecDeque::new())),
-            last_frame_time: None,
         }
     }
 }
@@ -202,7 +199,6 @@ impl ScreenCapture for MacOSCapture {
             height,
         });
         self.running = true;
-        self.last_frame_time = None;
 
         info!("macOS screen capture started ({}x{} @ {}fps)", width, height, config.target_fps);
 
@@ -241,15 +237,8 @@ impl ScreenCapture for MacOSCapture {
             return Err(CaptureError::NotStarted);
         }
 
-        let config = self.config.as_ref().ok_or(CaptureError::NotStarted)?;
-
-        // Rate-limit polling to target FPS
-        let frame_interval = Duration::from_secs_f64(1.0 / config.target_fps as f64);
-        if let Some(last) = self.last_frame_time {
-            if last.elapsed() < frame_interval {
-                return Ok(None);
-            }
-        }
+        // ScreenCaptureKit's minimum_frame_interval already rate-limits delivery,
+        // so no software rate-limiter needed here.
 
         let mut buf = self
             .frame_buffer
@@ -257,18 +246,12 @@ impl ScreenCapture for MacOSCapture {
             .map_err(|e| CaptureError::Platform(format!("Buffer lock poisoned: {e}")))?;
 
         // Take the most recent frame, discard older ones
-        let frame = if buf.len() > 1 {
+        if buf.len() > 1 {
             let latest = buf.pop_back();
             buf.clear();
-            latest
+            Ok(latest)
         } else {
-            buf.pop_front()
-        };
-
-        if frame.is_some() {
-            self.last_frame_time = Some(Instant::now());
+            Ok(buf.pop_front())
         }
-
-        Ok(frame)
     }
 }

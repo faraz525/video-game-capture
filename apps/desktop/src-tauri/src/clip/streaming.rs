@@ -7,6 +7,10 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
+/// GOP size as a multiple of the frame rate (e.g., 2 means a keyframe every 2 seconds).
+/// Shared with engine.rs for computing `fragment_duration_us`.
+pub const GOP_MULTIPLIER: u32 = 2;
+
 /// Error type for streaming encoder operations.
 #[derive(Debug, thiserror::Error)]
 pub enum StreamingEncoderError {
@@ -39,6 +43,10 @@ pub trait StreamingEncoder: Send {
     fn stop(&mut self) -> Result<(), StreamingEncoderError>;
     #[allow(dead_code)]
     fn is_running(&self) -> bool;
+    /// Returns the SyncClock timestamp (us) of the first frame pushed.
+    fn first_frame_timestamp_us(&self) -> Option<u64>;
+    /// Returns the number of frames dropped due to backpressure.
+    fn dropped_frame_count(&self) -> u64;
 }
 
 /// FFmpeg-based streaming encoder that produces fragmented MP4 chunks.
@@ -55,6 +63,10 @@ pub struct FfmpegStreamingEncoder {
     /// Bounded channel to send frame data to the writer thread without blocking.
     frame_tx: Option<mpsc::SyncSender<Vec<u8>>>,
     frame_count: u64,
+    dropped_frame_count: u64,
+    /// SyncClock timestamp (us) of the first frame pushed. Used to offset
+    /// synthetic chunk timestamps so they align with the shared clock.
+    first_frame_timestamp_us: Option<u64>,
 }
 
 impl FfmpegStreamingEncoder {
@@ -66,6 +78,8 @@ impl FfmpegStreamingEncoder {
             writer_handle: None,
             frame_tx: None,
             frame_count: 0,
+            dropped_frame_count: 0,
+            first_frame_timestamp_us: None,
         }
     }
 }
@@ -104,7 +118,7 @@ impl StreamingEncoder for FfmpegStreamingEncoder {
                         StreamingEncoderError::Process("stdin not available".into())
                     })?;
 
-                    const FRAME_CHANNEL_CAPACITY: usize = 4;
+                    const FRAME_CHANNEL_CAPACITY: usize = 8;
                     let (frame_tx, frame_rx) =
                         mpsc::sync_channel::<Vec<u8>>(FRAME_CHANNEL_CAPACITY);
 
@@ -148,15 +162,21 @@ impl StreamingEncoder for FfmpegStreamingEncoder {
             .as_ref()
             .ok_or(StreamingEncoderError::NotRunning)?;
 
+        // Record SyncClock timestamp of the very first frame
+        if self.first_frame_timestamp_us.is_none() {
+            self.first_frame_timestamp_us = Some(frame.timestamp_us);
+        }
+
         match tx.try_send(frame.data.clone()) {
             Ok(()) => {
                 self.frame_count += 1;
                 Ok(())
             }
             Err(mpsc::TrySendError::Full(_)) => {
+                self.dropped_frame_count += 1;
                 warn!(
-                    "Streaming encoder: frame {} dropped (backpressure)",
-                    self.frame_count
+                    "Streaming encoder: frame {} dropped (backpressure, total dropped: {})",
+                    self.frame_count, self.dropped_frame_count
                 );
                 self.frame_count += 1;
                 Ok(())
@@ -172,7 +192,9 @@ impl StreamingEncoder for FfmpegStreamingEncoder {
         match rx.try_recv() {
             Ok(chunk) => Ok(Some(chunk)),
             Err(mpsc::TryRecvError::Empty) => Ok(None),
-            Err(mpsc::TryRecvError::Disconnected) => Ok(None),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Err(StreamingEncoderError::Process("chunk reader disconnected".into()))
+            }
         }
     }
 
@@ -217,13 +239,26 @@ impl StreamingEncoder for FfmpegStreamingEncoder {
         }
 
         // Keep chunk_rx alive so callers can drain remaining chunks after stop.
+        info!(
+            "Streaming encoder stopped (frames sent: {}, frames dropped: {})",
+            self.frame_count, self.dropped_frame_count
+        );
         self.frame_count = 0;
-        info!("Streaming encoder stopped");
+        self.dropped_frame_count = 0;
+        self.first_frame_timestamp_us = None;
         Ok(())
     }
 
     fn is_running(&self) -> bool {
         self.child.is_some()
+    }
+
+    fn first_frame_timestamp_us(&self) -> Option<u64> {
+        self.first_frame_timestamp_us
+    }
+
+    fn dropped_frame_count(&self) -> u64 {
+        self.dropped_frame_count
     }
 }
 
@@ -290,7 +325,7 @@ fn start_ffmpeg_process(
     (Child, mpsc::Receiver<EncodedChunk>, thread::JoinHandle<()>),
     StreamingEncoderError,
 > {
-    let gop_size = (config.fps * 2).to_string();
+    let gop_size = (config.fps * GOP_MULTIPLIER).to_string();
 
     let mut cmd = Command::new(ffmpeg_path);
     cmd.args([
@@ -315,10 +350,10 @@ fn start_ffmpeg_process(
         "pipe:1",
     ]);
 
-    // Redirect stderr to null to prevent pipe buffer deadlock
+    // Capture stderr for diagnostic logging instead of discarding it
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
 
     let mut child = cmd
         .spawn()
@@ -329,10 +364,24 @@ fn start_ffmpeg_process(
         .take()
         .ok_or_else(|| StreamingEncoderError::Process("no stdout".to_string()))?;
 
+    // Spawn a thread to drain stderr and log it at debug level
+    if let Some(stderr) = child.stderr.take() {
+        thread::spawn(move || {
+            use std::io::BufRead;
+            let reader = std::io::BufReader::new(stderr);
+            for line in reader.lines() {
+                match line {
+                    Ok(line) => debug!("FFmpeg stderr: {}", line),
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
     let (tx, rx) = mpsc::channel();
 
-    // Calculate fragment duration based on GOP size (fps * 2 frames per fragment)
-    let gop_frames = config.fps * 2;
+    // Calculate fragment duration based on GOP size
+    let gop_frames = config.fps * GOP_MULTIPLIER;
     let fragment_duration_us = (gop_frames as u64 * 1_000_000) / config.fps as u64;
 
     // Spawn reader thread that parses MP4 boxes from stdout
