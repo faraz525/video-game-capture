@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
@@ -21,6 +21,7 @@ export function useClips() {
   const [clips, setClips] = useState<ClipSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const hasFetched = useRef(false);
 
   const fetchClips = useCallback(async () => {
     if (!isTauri()) {
@@ -29,10 +30,16 @@ export function useClips() {
       return;
     }
     try {
-      setLoading(true);
+      // Only show loading spinner on initial fetch — refetches update
+      // clips in-place without unmounting ClipCards (which would cause
+      // all thumbnails to re-fetch from disk).
+      if (!hasFetched.current) {
+        setLoading(true);
+      }
       setError(null);
       const result = await invoke<ClipSummary[]>("list_clips");
       setClips(result);
+      hasFetched.current = true;
     } catch (err) {
       setError(String(err));
     } finally {

@@ -368,6 +368,41 @@ fn verify_checksum(
     Ok(())
 }
 
+/// Read only the metadata from a .gameclip file (fast — skips video/audio/input).
+///
+/// Opens the zip and reads only `metadata.json`, avoiding the expensive
+/// decompression of `video.bin` and other large entries.
+pub fn read_clip_metadata(path: &Path) -> Result<ClipMetadata, ClipFormatError> {
+    let file = File::open(path)?;
+    let mut archive = zip::ZipArchive::new(file)?;
+
+    let mut entry = archive
+        .by_name("metadata.json")
+        .map_err(|_| ClipFormatError::MissingFile("metadata.json".to_string()))?;
+    let mut buf = String::new();
+    entry.read_to_string(&mut buf)?;
+    let metadata: ClipMetadata = serde_json::from_str(&buf)?;
+    Ok(metadata)
+}
+
+/// Read only the thumbnail from a .gameclip file (fast — skips video/audio/input).
+///
+/// Returns the raw JPEG bytes, or an empty Vec if no thumbnail is stored.
+pub fn read_clip_thumbnail(path: &Path) -> Result<Vec<u8>, ClipFormatError> {
+    let file = File::open(path)?;
+    let mut archive = zip::ZipArchive::new(file)?;
+
+    let result = match archive.by_name("thumbnail.jpg") {
+        Ok(mut entry) => {
+            let mut buf = Vec::new();
+            entry.read_to_end(&mut buf)?;
+            buf
+        }
+        Err(_) => Vec::new(),
+    };
+    Ok(result)
+}
+
 /// Migrate a v1 .gameclip file to v2 format (with checksums).
 ///
 /// Reads the clip, then rewrites it with checksums computed for all entries.

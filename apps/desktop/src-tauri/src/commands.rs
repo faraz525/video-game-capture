@@ -1,7 +1,7 @@
 use crate::annotation;
 use crate::annotation::export::ExportResult;
 use crate::annotation::types::{ClipAnnotations, FrameAction, QualityScore};
-use crate::clip::format::read_clip;
+use crate::clip::format::{read_clip, read_clip_metadata, read_clip_thumbnail};
 use crate::clip::metadata::ClipMetadata;
 use crate::engine::{AppSettings, EngineState};
 use crate::input::InputEvent;
@@ -48,22 +48,22 @@ pub fn list_clips(state: State<'_, EngineState>) -> Result<Vec<ClipSummary>, Str
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) == Some("gameclip") {
-            match read_clip(&path) {
-                Ok(contents) => {
+            match read_clip_metadata(&path) {
+                Ok(meta) => {
                     clips.push(ClipSummary {
-                        id: contents.metadata.id.clone(),
-                        name: contents.metadata.name.clone(),
-                        game: contents.metadata.game.clone(),
-                        duration_secs: contents.metadata.duration_secs,
-                        created_at: contents.metadata.created_at.to_rfc3339(),
+                        id: meta.id.clone(),
+                        name: meta.name.clone(),
+                        game: meta.game.clone(),
+                        duration_secs: meta.duration_secs,
+                        created_at: meta.created_at.to_rfc3339(),
                         file_path: path.to_string_lossy().to_string(),
-                        input_event_count: contents.metadata.input_event_count,
-                        has_audio: contents.metadata.has_audio,
-                        width: contents.metadata.width,
-                        height: contents.metadata.height,
-                        fps: contents.metadata.fps,
-                        video_encoded: contents.metadata.video_encoded,
-                        annotation_layers: contents.metadata.annotation_layers.clone(),
+                        input_event_count: meta.input_event_count,
+                        has_audio: meta.has_audio,
+                        width: meta.width,
+                        height: meta.height,
+                        fps: meta.fps,
+                        video_encoded: meta.video_encoded,
+                        annotation_layers: meta.annotation_layers.clone(),
                     });
                 }
                 Err(e) => {
@@ -185,17 +185,20 @@ pub async fn extract_clip_video(file_path: String) -> Result<String, String> {
 
 /// Get thumbnail from a .gameclip file as a base64 data URL.
 /// Returns None if the clip has no thumbnail.
+///
+/// Uses a targeted zip reader that only extracts `thumbnail.jpg`,
+/// avoiding the expensive decompression of `video.bin`.
 #[tauri::command]
 pub fn get_clip_thumbnail(file_path: String) -> Result<Option<String>, String> {
     debug!("Loading thumbnail for clip: {file_path}");
     let path = PathBuf::from(&file_path);
-    let contents = read_clip(&path).map_err(|e| e.to_string())?;
+    let thumbnail = read_clip_thumbnail(&path).map_err(|e| e.to_string())?;
 
-    if contents.thumbnail.is_empty() {
+    if thumbnail.is_empty() {
         return Ok(None);
     }
 
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&contents.thumbnail);
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&thumbnail);
     Ok(Some(format!("data:image/jpeg;base64,{b64}")))
 }
 
