@@ -1,3 +1,4 @@
+import { memo } from "react";
 import { useThumbnail } from "../hooks/useThumbnail";
 import type { ClipSummary } from "../hooks/useClips";
 
@@ -23,7 +24,7 @@ function formatDate(iso: string): string {
   });
 }
 
-export function ClipCard({ clip, onSelect, onDelete }: ClipCardProps) {
+export const ClipCard = memo(function ClipCard({ clip, onSelect, onDelete }: ClipCardProps) {
   const thumbnail = useThumbnail(clip.file_path);
 
   return (
@@ -75,4 +76,4 @@ export function ClipCard({ clip, onSelect, onDelete }: ClipCardProps) {
       </button>
     </div>
   );
-}
+});

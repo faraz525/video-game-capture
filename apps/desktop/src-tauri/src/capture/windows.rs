@@ -1,4 +1,4 @@
-use super::{CaptureConfig, CaptureError, CapturedFrame, ScreenCapture};
+use super::{CaptureConfig, CaptureError, CapturedFrame, FramePixelFormat, ScreenCapture};
 use crate::sync::clock::SyncClock;
 use log::{error, warn};
 use std::time::{Duration, Instant};
@@ -56,6 +56,8 @@ impl WindowsCapture {
     }
 
     /// Convert BGRA pixel data to RGBA in-place.
+    /// Retained for potential future use (e.g., raw RGBA fallback path).
+    #[allow(dead_code)]
     fn bgra_to_rgba(data: &mut [u8]) {
         for pixel in data.chunks_exact_mut(4) {
             pixel.swap(0, 2); // swap B and R
@@ -155,8 +157,6 @@ impl ScreenCapture for WindowsCapture {
             return Ok(None);
         };
 
-        Self::bgra_to_rgba(&mut data);
-
         self.last_frame_time = Some(Instant::now());
 
         Ok(Some(CapturedFrame {
@@ -164,6 +164,7 @@ impl ScreenCapture for WindowsCapture {
             width,
             height,
             data,
+            pixel_format: FramePixelFormat::Bgra,
         }))
     }
 }

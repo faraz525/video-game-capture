@@ -102,8 +102,9 @@ export function SettingsPage({
               value={`${draft.capture_width}x${draft.capture_height}`}
               onChange={(e) => {
                 const [w, h] = e.target.value.split("x").map(Number);
-                updateField("capture_width", w);
-                updateField("capture_height", h);
+                setDraft((prev) =>
+                  prev ? { ...prev, capture_width: w, capture_height: h } : prev,
+                );
               }}
               className="setting-input"
             >
@@ -126,6 +127,93 @@ export function SettingsPage({
               className="setting-input setting-input-wide"
             />
           </label>
+        </div>
+
+        <div className="setting-group">
+          <h3>HuggingFace Upload</h3>
+
+          <label className="setting-label">
+            <span>Enable Dataset Upload</span>
+            <input
+              type="checkbox"
+              checked={draft.huggingface.upload_consent}
+              onChange={(e) =>
+                updateField("huggingface", {
+                  ...draft.huggingface,
+                  upload_consent: e.target.checked,
+                })
+              }
+            />
+          </label>
+
+          {draft.huggingface.upload_consent && (
+            <>
+              <label className="setting-label">
+                <span>API Token</span>
+                <input
+                  type="password"
+                  value={draft.huggingface.token}
+                  onChange={(e) =>
+                    updateField("huggingface", {
+                      ...draft.huggingface,
+                      token: e.target.value,
+                    })
+                  }
+                  placeholder="hf_..."
+                  className="setting-input setting-input-wide"
+                />
+              </label>
+
+              <label className="setting-label">
+                <span>Dataset Repository</span>
+                <input
+                  type="text"
+                  value={draft.huggingface.repo_id}
+                  onChange={(e) =>
+                    updateField("huggingface", {
+                      ...draft.huggingface,
+                      repo_id: e.target.value,
+                    })
+                  }
+                  placeholder="username/gameclip-dataset"
+                  className="setting-input setting-input-wide"
+                />
+              </label>
+
+              <label className="setting-label">
+                <span>
+                  Quality Gate ({(draft.huggingface.quality_gate * 100).toFixed(0)}%)
+                </span>
+                <input
+                  type="range"
+                  min={0}
+                  max={100}
+                  value={draft.huggingface.quality_gate * 100}
+                  onChange={(e) =>
+                    updateField("huggingface", {
+                      ...draft.huggingface,
+                      quality_gate: parseInt(e.target.value) / 100,
+                    })
+                  }
+                  className="setting-input"
+                />
+              </label>
+
+              <label className="setting-label">
+                <span>Private Repository</span>
+                <input
+                  type="checkbox"
+                  checked={draft.huggingface.private_repo}
+                  onChange={(e) =>
+                    updateField("huggingface", {
+                      ...draft.huggingface,
+                      private_repo: e.target.checked,
+                    })
+                  }
+                />
+              </label>
+            </>
+          )}
         </div>
 
         <div className="settings-actions">

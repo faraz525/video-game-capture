@@ -1,10 +1,9 @@
-use super::{CaptureConfig, CaptureError, CapturedFrame, ScreenCapture};
+use super::{CaptureConfig, CaptureError, CapturedFrame, FramePixelFormat, ScreenCapture};
 use crate::sync::clock::SyncClock;
 use log::{error, info, warn};
 use screencapturekit::prelude::*;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
 const MAX_BUFFERED_FRAMES: usize = 10;
 
@@ -20,7 +19,6 @@ pub struct MacOSCapture {
     running: bool,
     stream: Option<SendableStream>,
     frame_buffer: Arc<Mutex<VecDeque<CapturedFrame>>>,
-    last_frame_time: Option<Instant>,
 }
 
 /// Wrapper to make SCStream sendable across threads.
@@ -83,7 +81,9 @@ impl SCStreamOutputTrait for FrameHandler {
         }
 
         // Copy pixel data, stripping any row padding from GPU alignment.
-        // ScreenCaptureKit delivers BGRA; we convert to RGBA in-place.
+        // ScreenCaptureKit delivers native BGRA — we keep it as-is to avoid
+        // per-frame swizzling on the capture hot path. Downstream consumers
+        // (FFmpeg, thumbnail) handle the pixel format via the tag.
         let row_bytes = (width as usize) * 4;
         let mut data = Vec::with_capacity(row_bytes * height as usize);
 
@@ -96,16 +96,12 @@ impl SCStreamOutputTrait for FrameHandler {
             data.extend_from_slice(&slice[row_start..row_end]);
         }
 
-        // BGRA → RGBA: swap B and R channels
-        for pixel in data.chunks_exact_mut(4) {
-            pixel.swap(0, 2);
-        }
-
         let frame = CapturedFrame {
             timestamp_us: self.clock.now_us(),
             width,
             height,
             data,
+            pixel_format: FramePixelFormat::Bgra,
         };
 
         if let Ok(mut buf) = self.buffer.lock() {
@@ -126,7 +122,6 @@ impl MacOSCapture {
             running: false,
             stream: None,
             frame_buffer: Arc::new(Mutex::new(VecDeque::new())),
-            last_frame_time: None,
         }
     }
 }
@@ -176,7 +171,7 @@ impl ScreenCapture for MacOSCapture {
         let stream_config = SCStreamConfiguration::builder()
             .width(width)
             .height(height)
-            .minimum_frame_interval(1, config.target_fps as i32)
+            .minimum_frame_interval(9, (config.target_fps * 10) as i32)
             .pixel_format(PixelFormat::BGRA)
             .shows_cursor(true)
             .build();
@@ -202,7 +197,6 @@ impl ScreenCapture for MacOSCapture {
             height,
         });
         self.running = true;
-        self.last_frame_time = None;
 
         info!("macOS screen capture started ({}x{} @ {}fps)", width, height, config.target_fps);
 
@@ -241,34 +235,15 @@ impl ScreenCapture for MacOSCapture {
             return Err(CaptureError::NotStarted);
         }
 
-        let config = self.config.as_ref().ok_or(CaptureError::NotStarted)?;
-
-        // Rate-limit polling to target FPS
-        let frame_interval = Duration::from_secs_f64(1.0 / config.target_fps as f64);
-        if let Some(last) = self.last_frame_time {
-            if last.elapsed() < frame_interval {
-                return Ok(None);
-            }
-        }
+        // Return frames in FIFO order so the engine can drain all buffered
+        // frames per iteration. The MAX_BUFFERED_FRAMES cap in the SCK callback
+        // provides backpressure; discarding here would lose real motion data.
 
         let mut buf = self
             .frame_buffer
             .lock()
             .map_err(|e| CaptureError::Platform(format!("Buffer lock poisoned: {e}")))?;
 
-        // Take the most recent frame, discard older ones
-        let frame = if buf.len() > 1 {
-            let latest = buf.pop_back();
-            buf.clear();
-            latest
-        } else {
-            buf.pop_front()
-        };
-
-        if frame.is_some() {
-            self.last_frame_time = Some(Instant::now());
-        }
-
-        Ok(frame)
+        Ok(buf.pop_front())
     }
 }

@@ -1,5 +1,5 @@
-import { useState, useEffect, useCallback } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { useState, useEffect, useCallback, useRef } from "react";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
 export interface ClipSummary {
@@ -21,13 +21,25 @@ export function useClips() {
   const [clips, setClips] = useState<ClipSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const hasFetched = useRef(false);
 
   const fetchClips = useCallback(async () => {
+    if (!isTauri()) {
+      setLoading(false);
+      setError("Not running inside Tauri — clip IPC unavailable");
+      return;
+    }
     try {
-      setLoading(true);
+      // Only show loading spinner on initial fetch — refetches update
+      // clips in-place without unmounting ClipCards (which would cause
+      // all thumbnails to re-fetch from disk).
+      if (!hasFetched.current) {
+        setLoading(true);
+      }
       setError(null);
       const result = await invoke<ClipSummary[]>("list_clips");
       setClips(result);
+      hasFetched.current = true;
     } catch (err) {
       setError(String(err));
     } finally {
@@ -37,6 +49,7 @@ export function useClips() {
 
   const deleteClip = useCallback(
     async (filePath: string) => {
+      if (!isTauri()) return;
       try {
         await invoke("delete_clip", { filePath });
         await fetchClips();
@@ -48,6 +61,7 @@ export function useClips() {
   );
 
   const saveClip = useCallback(async () => {
+    if (!isTauri()) return null;
     try {
       const path = await invoke<string>("save_clip");
       await fetchClips();
@@ -63,6 +77,8 @@ export function useClips() {
   }, [fetchClips]);
 
   useEffect(() => {
+    if (!isTauri()) return;
+
     const unlisten = listen("clip-saved", () => {
       fetchClips();
     }).catch((err) => {

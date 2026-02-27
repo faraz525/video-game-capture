@@ -1,16 +1,18 @@
 use crate::annotation;
 use crate::annotation::export::ExportResult;
 use crate::annotation::types::{ClipAnnotations, FrameAction, QualityScore};
-use crate::clip::format::read_clip;
+use crate::clip::format::{read_clip, read_clip_metadata, read_clip_thumbnail};
 use crate::clip::metadata::ClipMetadata;
 use crate::engine::{AppSettings, EngineState};
 use crate::input::InputEvent;
+use crate::upload::progress::UploadProgress;
 use base64::Engine as _;
 use log::{debug, info, warn};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use tauri::State;
+use tauri::{Emitter, State};
 
 /// Serializable clip summary for the frontend.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -46,22 +48,22 @@ pub fn list_clips(state: State<'_, EngineState>) -> Result<Vec<ClipSummary>, Str
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) == Some("gameclip") {
-            match read_clip(&path) {
-                Ok(contents) => {
+            match read_clip_metadata(&path) {
+                Ok(meta) => {
                     clips.push(ClipSummary {
-                        id: contents.metadata.id.clone(),
-                        name: contents.metadata.name.clone(),
-                        game: contents.metadata.game.clone(),
-                        duration_secs: contents.metadata.duration_secs,
-                        created_at: contents.metadata.created_at.to_rfc3339(),
+                        id: meta.id.clone(),
+                        name: meta.name.clone(),
+                        game: meta.game.clone(),
+                        duration_secs: meta.duration_secs,
+                        created_at: meta.created_at.to_rfc3339(),
                         file_path: path.to_string_lossy().to_string(),
-                        input_event_count: contents.metadata.input_event_count,
-                        has_audio: contents.metadata.has_audio,
-                        width: contents.metadata.width,
-                        height: contents.metadata.height,
-                        fps: contents.metadata.fps,
-                        video_encoded: contents.metadata.video_encoded,
-                        annotation_layers: contents.metadata.annotation_layers.clone(),
+                        input_event_count: meta.input_event_count,
+                        has_audio: meta.has_audio,
+                        width: meta.width,
+                        height: meta.height,
+                        fps: meta.fps,
+                        video_encoded: meta.video_encoded,
+                        annotation_layers: meta.annotation_layers.clone(),
                     });
                 }
                 Err(e) => {
@@ -183,26 +185,40 @@ pub async fn extract_clip_video(file_path: String) -> Result<String, String> {
 
 /// Get thumbnail from a .gameclip file as a base64 data URL.
 /// Returns None if the clip has no thumbnail.
+///
+/// Uses a targeted zip reader that only extracts `thumbnail.jpg`,
+/// avoiding the expensive decompression of `video.bin`.
 #[tauri::command]
 pub fn get_clip_thumbnail(file_path: String) -> Result<Option<String>, String> {
     debug!("Loading thumbnail for clip: {file_path}");
     let path = PathBuf::from(&file_path);
-    let contents = read_clip(&path).map_err(|e| e.to_string())?;
+    let thumbnail = read_clip_thumbnail(&path).map_err(|e| e.to_string())?;
 
-    if contents.thumbnail.is_empty() {
+    if thumbnail.is_empty() {
         return Ok(None);
     }
 
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&contents.thumbnail);
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&thumbnail);
     Ok(Some(format!("data:image/jpeg;base64,{b64}")))
 }
 
-/// Get input events from a .gameclip file.
+/// Input events bundled with the video start timestamp for playback sync.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ClipInputData {
+    pub events: Vec<InputEvent>,
+    pub video_start_timestamp_us: u64,
+}
+
+/// Get input events from a .gameclip file, along with the video start
+/// timestamp so the frontend can align input overlay with video playback.
 #[tauri::command]
-pub fn get_clip_input_events(file_path: String) -> Result<Vec<InputEvent>, String> {
+pub fn get_clip_input_events(file_path: String) -> Result<ClipInputData, String> {
     let path = PathBuf::from(&file_path);
     let contents = read_clip(&path).map_err(|e| e.to_string())?;
-    Ok(contents.input_events)
+    Ok(ClipInputData {
+        events: contents.input_events,
+        video_start_timestamp_us: contents.metadata.video_start_timestamp_us,
+    })
 }
 
 // --- Annotation Pipeline Commands ---
@@ -329,4 +345,53 @@ pub async fn export_clips(
         }
         _ => Err(format!("Unknown export format: {format}. Use 'json_sidecar' or 'huggingface'")),
     }
+}
+
+// --- Upload Pipeline Commands ---
+
+/// Upload clips to HuggingFace dataset.
+///
+/// Emits `upload-progress` events to the webview with UploadProgress payloads.
+/// Respects the cancel flag set by `cancel_upload`.
+#[tauri::command]
+pub async fn upload_clips(
+    app: tauri::AppHandle,
+    state: State<'_, EngineState>,
+    clip_paths: Vec<String>,
+) -> Result<u32, String> {
+    // Extract config and cancel flag while holding state, then drop it
+    let (config, cancel) = {
+        let settings = state.settings.lock().map_err(|e| e.to_string())?;
+        let config = settings.huggingface.clone();
+        let flag = state.upload_cancel.lock().map_err(|e| e.to_string())?;
+        flag.store(false, Ordering::SeqCst);
+        let cancel = Arc::clone(&flag);
+        (config, cancel)
+    }; // MutexGuards dropped here
+
+    let paths: Vec<PathBuf> = clip_paths.iter().map(PathBuf::from).collect();
+    let handle = app.clone();
+
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::upload::hf_client::upload_clips(
+            &config,
+            &paths,
+            cancel,
+            |progress: UploadProgress| {
+                let _ = handle.emit("upload-progress", &progress);
+            },
+        )
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Cancel an in-progress upload.
+#[tauri::command]
+pub fn cancel_upload(state: State<'_, EngineState>) -> Result<(), String> {
+    let flag = state.upload_cancel.lock().map_err(|e| e.to_string())?;
+    flag.store(true, Ordering::SeqCst);
+    info!("Upload cancellation requested");
+    Ok(())
 }

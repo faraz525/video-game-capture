@@ -21,8 +21,9 @@ interface InputOverlayProps {
   captureHeight?: number;
 }
 
-const VISIBLE_WINDOW_US = 500_000; // Show events within 500ms of current time
-const KEY_DISPLAY_DURATION_US = 300_000; // Keys stay visible for 300ms
+const VISIBLE_WINDOW_US = 500_000; // Show events within 500ms before current time
+const CLICK_DISPLAY_DURATION_US = 300_000; // Click ripples stay visible for 300ms
+const LOOK_AHEAD_US = 50_000; // 50ms look-ahead tolerance for timing jitter
 
 export function InputOverlay({
   events,
@@ -36,26 +37,24 @@ export function InputOverlay({
     return events.filter(
       (e) =>
         e.timestamp_us >= currentTimeUs - VISIBLE_WINDOW_US &&
-        e.timestamp_us <= currentTimeUs,
+        e.timestamp_us <= currentTimeUs + LOOK_AHEAD_US,
     );
   }, [events, currentTimeUs]);
 
   const activeKeys = useMemo(() => {
-    const keys = new Map<string, number>();
-    for (const e of visibleEvents) {
-      if (e.type === "key" && e.key && e.pressed) {
-        keys.set(e.key, e.timestamp_us);
+    // Walk all events up to currentTimeUs to build accurate held-key state.
+    // A key is "active" if its last event before currentTimeUs was a key-down.
+    const keyState = new Map<string, boolean>();
+    for (const e of events) {
+      if (e.timestamp_us > currentTimeUs) break;
+      if (e.type === "key" && e.key) {
+        keyState.set(e.key, e.pressed === true);
       }
     }
-    // Only show keys pressed within display duration
-    const result: string[] = [];
-    keys.forEach((ts, key) => {
-      if (currentTimeUs - ts < KEY_DISPLAY_DURATION_US) {
-        result.push(key);
-      }
-    });
-    return result;
-  }, [visibleEvents, currentTimeUs]);
+    return Array.from(keyState.entries())
+      .filter(([, held]) => held)
+      .map(([key]) => key);
+  }, [events, currentTimeUs]);
 
   const mousePosition = useMemo(() => {
     const moves = visibleEvents
@@ -76,7 +75,7 @@ export function InputOverlay({
         (e) =>
           e.type === "mouse_button" &&
           e.pressed &&
-          currentTimeUs - e.timestamp_us < KEY_DISPLAY_DURATION_US,
+          currentTimeUs - e.timestamp_us < CLICK_DISPLAY_DURATION_US,
       )
       .map((e) => ({
         x: ((e.x ?? 0) / captureWidth) * width,

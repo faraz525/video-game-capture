@@ -1,4 +1,4 @@
-use super::{CaptureConfig, CaptureError, CapturedFrame, ScreenCapture};
+use super::{CaptureConfig, CaptureError, CapturedFrame, FramePixelFormat, ScreenCapture};
 use crate::sync::clock::SyncClock;
 use std::time::{Duration, Instant};
 
@@ -52,6 +52,7 @@ impl MockCapture {
             width: config.width,
             height: config.height,
             data,
+            pixel_format: FramePixelFormat::Rgba,
         }
     }
 }

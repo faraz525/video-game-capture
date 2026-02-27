@@ -8,7 +8,7 @@ use core_graphics::event::{
     CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
     CGEventTapProxy, CGEventType, EventField,
 };
-use log::{error, info, warn};
+use log::{info, warn};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -43,18 +43,29 @@ impl InputRecorder for MacOSInputRecorder {
             return Err(InputError::AlreadyRunning);
         }
 
-        self.running = true;
         let events = Arc::clone(&self.events);
         let clock = self.clock.clone();
         let run_loop_store = Arc::clone(&self.run_loop);
 
+        // Confirmation channel: the tap thread sends Ok(()) on success or
+        // Err(InputError) if the CGEventTap could not be created.
+        let (confirm_tx, confirm_rx) = std::sync::mpsc::sync_channel::<Result<(), InputError>>(1);
+
         thread::spawn(move || {
-            if let Err(e) = run_event_tap_loop(events, clock, run_loop_store) {
-                error!("CGEventTap loop error: {e}");
-            }
+            run_event_tap_loop(events, clock, run_loop_store, confirm_tx);
         });
 
-        Ok(())
+        // Wait up to 5 seconds for the tap thread to confirm success
+        match confirm_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(Ok(())) => {
+                self.running = true;
+                Ok(())
+            }
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(InputError::Platform(
+                "CGEventTap thread did not confirm within 5s".to_string(),
+            )),
+        }
     }
 
     fn stop(&mut self) -> Result<(), InputError> {
@@ -92,11 +103,16 @@ impl InputRecorder for MacOSInputRecorder {
 }
 
 /// Run the CFRunLoop with a CGEventTap on a dedicated thread.
+///
+/// Sends `Ok(())` on `confirm_tx` after the tap is successfully created and
+/// running, or `Err(InputError)` if creation fails. The caller waits on this
+/// channel before setting `running = true`.
 fn run_event_tap_loop(
     events: Arc<Mutex<Vec<InputEvent>>>,
     clock: SyncClock,
     run_loop_store: Arc<Mutex<Option<CFRunLoop>>>,
-) -> Result<(), InputError> {
+    confirm_tx: std::sync::mpsc::SyncSender<Result<(), InputError>>,
+) {
     let events_of_interest = vec![
         CGEventType::KeyDown,
         CGEventType::KeyUp,
@@ -140,16 +156,22 @@ fn run_event_tap_loop(
                  Input recording disabled. Grant access in System Settings > \
                  Privacy & Security > Accessibility."
             );
-            return Err(InputError::Platform(
+            let _ = confirm_tx.send(Err(InputError::Platform(
                 "CGEventTap creation failed (Accessibility permission denied)".to_string(),
-            ));
+            )));
+            return;
         }
     };
 
-    let loop_source = tap
-        .mach_port
-        .create_runloop_source(0)
-        .map_err(|()| InputError::Platform("Failed to create run loop source".to_string()))?;
+    let loop_source = match tap.mach_port.create_runloop_source(0) {
+        Ok(source) => source,
+        Err(()) => {
+            let _ = confirm_tx.send(Err(InputError::Platform(
+                "Failed to create run loop source".to_string(),
+            )));
+            return;
+        }
+    };
 
     let current_run_loop = CFRunLoop::get_current();
     current_run_loop.add_source(&loop_source, unsafe { kCFRunLoopCommonModes });
@@ -159,6 +181,9 @@ fn run_event_tap_loop(
     if let Ok(mut store) = run_loop_store.lock() {
         *store = Some(CFRunLoop::get_current());
     }
+
+    // Confirm success to the caller
+    let _ = confirm_tx.send(Ok(()));
 
     info!("macOS input recorder started (CGEventTap)");
 
@@ -171,7 +196,6 @@ fn run_event_tap_loop(
     }
 
     info!("macOS input recorder stopped");
-    Ok(())
 }
 
 /// Process a single CGEvent and push it to the shared buffer.

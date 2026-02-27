@@ -1,311 +1,224 @@
 # GameClip — Implementation Plan
 
-## Context
+## Vision
 
-Build a desktop screen capture tool for gamers (Windows target, developed on Mac Apple Silicon) that records gameplay clips with synchronized keyboard, mouse, and audio data. The clip tool is the distribution vehicle for two revenue streams: a bounty marketplace (indie devs pay community to clip achievements) and AI training datasets (gameplay + input data sold to model providers).
+GameClip is an open-source, lightweight desktop capture tool that records gameplay clips with synchronized input data. It is the distribution vehicle for the world's first open dataset of frame-action-annotated gameplay — training data that world model researchers (GameNGen, DIAMOND, Genie, NitroGen) desperately need.
 
-**Key decisions:** Windows-only, open-source capture engine, bounty marketplace first, KB/mouse + game audio.
+**Strategy:** Open source tool for adoption → community-contributed data → default dataset for world model training → enterprise/API monetization.
+
+**Key insight:** No existing tool bridges "game clip capture for gamers" and "training data pipeline for AI researchers." Medal.tv ($333M valuation) captures video for sharing but has no input annotations. OpenAI paid $80/hr for labeled Minecraft gameplay. GameClip produces that data format for free, at scale.
 
 ---
 
-## Project Structure
+## Architecture
+
+Tauri v2 monorepo: Rust backend captures screen/input/audio, React+TypeScript frontend displays clips. Developed on Mac with platform-specific implementations; real production capture targets Windows.
 
 ```
 gameclip/
 ├── apps/
-│   ├── desktop/               # Tauri app (Rust backend + web frontend)
-│   │   ├── src-tauri/         # Rust: capture engine, system tray, hotkeys
-│   │   │   ├── src/
-│   │   │   │   ├── capture/   # Platform-abstracted capture (traits + impls)
-│   │   │   │   ├── input/     # Input recording (traits + impls)
-│   │   │   │   ├── audio/     # Audio capture (traits + impls)
-│   │   │   │   ├── sync/      # Sync clock + ring buffer
-│   │   │   │   ├── clip/      # Clip packaging (.gameclip format)
-│   │   │   │   └── game/      # Game detection
-│   │   │   └── Cargo.toml
-│   │   └── src/               # Frontend: React + TypeScript
-│   │       ├── components/    # UI components
-│   │       ├── pages/         # Clip library, settings, bounty browser
-│   │       └── hooks/         # Tauri IPC hooks
-│   └── web/                   # Web app (clip viewer, bounty marketplace)
-├── packages/
-│   ├── clip-format/           # Shared .gameclip format lib (Rust)
-│   └── shared-types/          # Shared TypeScript types
-├── services/
-│   └── api/                   # Backend API (Node.js + Hono)
-├── Cargo.toml                 # Workspace root
-├── package.json               # pnpm workspace root
-└── turbo.json                 # Turborepo config
+│   └── desktop/
+│       ├── src-tauri/src/
+│       │   ├── capture/      # Platform-abstracted screen capture (trait + mock/macos/windows)
+│       │   ├── input/        # Input recording (trait + mock/macos/windows)
+│       │   ├── audio/        # Audio capture (trait + mock/windows)
+│       │   ├── sync/         # SyncClock + RingBuffer<T>
+│       │   ├── clip/         # .gameclip format, saver, encoder
+│       │   ├── game/         # Game detection (process scan + genre mapping)
+│       │   ├── annotation/   # ML annotation pipeline (frame_actions, quality, export)
+│       │   ├── engine.rs     # EngineState, capture loop, save_clip
+│       │   ├── commands.rs   # 13 Tauri IPC commands
+│       │   └── lib.rs        # App entry, tray, hotkey, IPC registration
+│       └── src/              # React + TypeScript frontend
+│           ├── pages/        # ClipLibrary, ClipPlayer, Settings
+│           ├── components/   # ClipCard, InputOverlay
+│           └── hooks/        # useClips, useClipData, useThumbnail, useSettings
+├── Cargo.toml                # Workspace root
+└── package.json              # pnpm workspace root
 ```
 
 ---
 
-## Implementation Steps
+## Completed Steps
 
 ### Step 1: Project Scaffolding ✅
-**Goal:** Tauri app boots, shows a window, sits in system tray.
-
-- Init git repo at `/Users/faraz525/Documents/gameclip`
-- Init Rust workspace (`Cargo.toml`) with `apps/desktop/src-tauri` member
-- Scaffold Tauri v2 app with React + TypeScript frontend (Vite)
-- Configure system tray with basic menu (Settings, Quit)
-- Register global hotkey (Ctrl+Shift+R) that logs to console
-- Add pnpm workspace for JS packages
-
-**Checkpoint 1:**
-- [x] `cargo build` succeeds
-- [x] System tray icon appears with menu
-- [x] Global hotkey press logs a message
-- [x] Git repo initialized with first commit
-
----
+Tauri app boots, system tray, global hotkey (Ctrl+Shift+R).
 
 ### Step 2: Platform Abstraction Layer ✅
-**Goal:** Define traits for all OS-specific operations with mock implementations that work on Mac.
-
-Create Rust traits:
-- `ScreenCapture` — start/stop capture, get frames
-- `InputRecorder` — start/stop recording, poll input events
-- `AudioCapture` — start/stop loopback, get audio buffers
-- `SyncClock` — high-resolution timestamps
-
-Implement `MockCapture` (generates colored frames at 60fps), `MockInput` (generates random key/mouse events), `MockAudio` (generates silence/sine wave).
-
-Use `cfg(target_os)` to compile real impls on Windows, mocks on Mac.
-
-**Files:**
-- `src-tauri/src/capture/mod.rs` — traits
-- `src-tauri/src/capture/mock.rs` — mock implementations
-- `src-tauri/src/capture/windows.rs` — stubs (compile-gated)
-- `src-tauri/src/input/mod.rs`, `mock.rs`, `windows.rs`
-- `src-tauri/src/audio/mod.rs`, `mock.rs`, `windows.rs`
-- `src-tauri/src/sync/clock.rs` — cross-platform clock abstraction
-
-**Checkpoint 2:**
-- [x] All traits defined with comprehensive doc comments
-- [x] Mock implementations pass unit tests
-- [x] `MockCapture` generates 60fps synthetic frames
-- [x] `MockInput` generates timestamped input events
-- [x] `SyncClock` produces monotonic microsecond timestamps
-- [x] `cargo test` passes on Mac (51 tests)
-
----
+Traits for ScreenCapture, InputRecorder, AudioCapture, SyncClock. Mock + macOS + Windows implementations. 28 tests.
 
 ### Step 3: Ring Buffer + Clip Save ✅
-**Goal:** Continuously buffer mock frames/input/audio, save to disk on hotkey.
-
-Implement ring buffer that holds last N seconds of:
-- Video frames (as raw/compressed buffers)
-- Input events (append-only log)
-- Audio buffers
-
-On hotkey press: flush ring buffer to `.gameclip` package.
-
-**Clip package format:**
-```
-clip_001.gameclip/  (zip archive)
-├── video.bin           # Video data (H.264 on Windows, raw frames for mock)
-├── input.jsonl         # Timestamped input events
-├── metadata.json       # Game, resolution, fps, duration, devices
-└── thumbnail.jpg       # First frame as thumbnail
-```
-
-**Files:**
-- `src-tauri/src/sync/ring_buffer.rs` — generic ring buffer
-- `src-tauri/src/clip/mod.rs` — clip packaging logic
-- `src-tauri/src/clip/format.rs` — .gameclip read/write
-- `src-tauri/src/clip/metadata.rs` — metadata schema
-- `src-tauri/src/clip/saver.rs` — coordinates ring buffers and saves
-- `src-tauri/src/commands.rs` — Tauri IPC commands
-- `src-tauri/src/engine.rs` — capture engine state management
-
-**Checkpoint 3:**
-- [x] Ring buffer correctly manages N seconds of data (unit tests)
-- [x] Ring buffer overwrites oldest data when full
-- [x] Hotkey triggers clip save from ring buffer
-- [x] `.gameclip` file is a valid zip with correct structure
-- [x] `input.jsonl` contains properly timestamped events
-- [x] `metadata.json` matches schema and has correct values
-- [x] Clip can be saved and re-read programmatically (round-trip test)
-
----
+Time-bounded ring buffer, .gameclip zip format, hotkey-triggered save, FFmpeg encoding with fallback. 23 tests.
 
 ### Step 4: Clip Library UI ✅
-**Goal:** User can view saved clips, see input overlay, manage clips.
+Clip grid, player with input overlay, settings page, Tauri IPC bridge. TypeScript clean.
 
-Built React frontend pages:
-- **Clip Library** — grid of saved clips with thumbnails
-- **Clip Player** — video playback with synchronized input overlay (shows keypresses, mouse position/clicks as they happened)
-- **Settings** — hotkey config, buffer duration, save location
+### Step 5: Data Annotation Pipeline ✅
+Frame-action state machine, genre-aware quality scoring, JSON sidecar + HuggingFace export. 51 tests.
 
-Tauri IPC commands:
-- `list_clips()` → returns clip metadata
-- `get_clip_metadata(file_path)` → returns full metadata
-- `delete_clip(file_path)` → removes clip
-- `save_clip()` → triggers clip save
-- `get_settings()` / `update_settings()`
+### Step 6: Windows Capture Engine (partial)
+DXGI, Raw Input, WASAPI code written but untested on real Windows hardware. macOS implementations (ScreenCaptureKit, CGEventTap) working.
 
-**Checkpoint 4:**
-- [x] Clip library shows saved clips in grid
-- [x] Clicking a clip opens the player
-- [x] Input overlay renders keyboard presses and mouse movements on top of video
-- [x] Input events visually sync with video playback
-- [x] Settings page allows changing hotkey and buffer duration
-- [x] Frontend TypeScript compiles clean
-- [x] Vite build succeeds
+**Current: 128 Rust tests, 0 frontend tests.**
 
 ---
 
-### Step 5: Windows Capture Engine (requires Windows VM)
-**Goal:** Replace mock implementations with real Windows APIs.
+## Next Steps — Production Readiness
 
-Implement:
-- `WindowsCapture` — DXGI Desktop Duplication API for screen capture
-- `WindowsEncoder` — NVENC (NVIDIA) / AMF (AMD) hardware encoding to H.264
-- `WindowsInput` — Raw Input API (`WM_INPUT` + `RIDEV_INPUTSINK`) for KB/mouse
-- `WindowsAudio` — WASAPI loopback for game audio
-- `WindowsClock` — `QueryPerformanceCounter` for high-res timestamps
-- `GameDetector` — enumerate running processes, match against known game executables
+### Step 7: In-Capture Encoding (Memory Fix) 🔴 CRITICAL
 
-**Files:**
-- `src-tauri/src/capture/windows.rs` — DXGI + NVENC/AMF
-- `src-tauri/src/input/windows.rs` — Raw Input API
-- `src-tauri/src/audio/windows.rs` — WASAPI loopback
-- `src-tauri/src/sync/clock_windows.rs` — QPC wrapper
-- `src-tauri/src/game/detector.rs` — process enumeration
+**Problem:** The ring buffer stores raw RGBA frames. At 1080p60 for 30s, that's ~14GB of RAM. Even at 640x360, it's ~830MB. This makes the tool unusable on most gaming PCs.
 
-**Dev workflow:**
-1. Write Rust code on Mac (compiles but can't run Windows APIs)
-2. Cross-compile: `cargo xwin build --target x86_64-pc-windows-msvc`
-3. Transfer binary to AWS g4dn.xlarge Windows VM
-4. Test with a real game, verify capture quality
+**Solution:** Encode frames in the capture thread using a streaming encoder. Store compressed H.264 chunks in the ring buffer instead of raw RGBA. Target: <200MB memory at 1080p60/30s.
 
-**Checkpoint 5:**
-- [ ] Cross-compilation succeeds from Mac to Windows
-- [ ] App launches on Windows VM
-- [ ] DXGI captures game frames at native resolution
-- [ ] Hardware encoder produces valid H.264 MP4
-- [ ] Raw Input captures KB/mouse even when game is focused
-- [ ] WASAPI captures game audio
-- [ ] All streams are synced within <1ms (verify with input overlay)
-- [ ] FPS impact is <3 frames at 1080p60
-- [ ] Game detector correctly identifies the running game
-- [ ] Full clip save produces valid `.gameclip` with real data
+**Design:**
+- New `EncodedChunk` struct: timestamp range, H.264 data, keyframe flag
+- `StreamingEncoder` trait: feed raw frames → get encoded chunks
+- `FfmpegStreamingEncoder`: long-running FFmpeg subprocess, segment output
+- `RingBuffer<EncodedChunk>` replaces `RingBuffer<CapturedFrame>` in ClipSaver
+- On save: concatenate chunks, write MP4 container, no re-encoding needed
+- Thumbnail extraction from first keyframe
+- Fallback: if encoder unavailable, keep raw RGBA at lower resolution
 
----
+**Key constraint:** The encoder must run continuously (not just at save time), accepting frames from the capture thread and emitting chunks. Save becomes a simple "drain and concatenate" operation.
 
-### Step 6: Backend API
-**Goal:** Users can upload clips, create accounts, browse community clips.
-
-- Node.js + Hono API server
-- PostgreSQL database (users, clips, bounties)
-- Cloudflare R2 for clip storage (S3-compatible, no egress fees)
-- Auth: Discord + Steam OAuth
-- Endpoints: clip CRUD, user profile, clip upload/download
-
-**Files:**
-- `services/api/src/index.ts` — Hono app entry
-- `services/api/src/routes/clips.ts` — clip endpoints
-- `services/api/src/routes/auth.ts` — OAuth flows
-- `services/api/src/routes/users.ts` — user profiles
-- `services/api/src/db/schema.ts` — Drizzle ORM schema
-- `services/api/src/storage/r2.ts` — R2 upload/download
-
-**Checkpoint 6:**
-- [ ] API server starts and responds to health check
-- [ ] Discord OAuth login flow works end-to-end
-- [ ] Clip metadata can be created, read, updated, deleted
-- [ ] Clip file uploads to R2 and downloads correctly
-- [ ] User profiles store and retrieve correctly
-- [ ] Input validation rejects malformed requests (Zod schemas)
-- [ ] All endpoints have integration tests passing
-
----
-
-### Step 7: Bounty Marketplace MVP
-**Goal:** Game devs can post bounties, gamers can submit clips to fulfill them.
-
-- Bounty CRUD (title, game, requirements, reward amount, deadline)
-- Bounty browser in desktop app and web
-- Clip submission to bounty (select existing clip or record new one)
-- Review workflow (bounty poster approves/rejects submissions)
-- Stripe Connect for payouts
-
-**Files:**
-- `services/api/src/routes/bounties.ts` — bounty endpoints
-- `services/api/src/routes/submissions.ts` — submission workflow
-- `services/api/src/payments/stripe.ts` — Stripe Connect integration
-- `apps/web/src/pages/bounties/` — web bounty browser
-- `apps/desktop/src/pages/bounties/` — in-app bounty browser
+**Files to modify:**
+- `clip/encoder.rs` — add `StreamingEncoder` trait + `FfmpegStreamingEncoder`
+- `clip/saver.rs` — new `EncodedChunk` type, swap `RingBuffer<CapturedFrame>` for `RingBuffer<EncodedChunk>`
+- `engine.rs` — create encoder at capture start, pipe frames through encoder before ring buffer
+- `clip/format.rs` — handle pre-encoded video data in write_clip
+- `commands.rs` — update extract_clip_video for pre-encoded clips
 
 **Checkpoint 7:**
-- [ ] Game dev can create a bounty with requirements and reward
-- [ ] Gamers can browse bounties filtered by game
-- [ ] Gamer can submit a clip to a bounty
-- [ ] Bounty poster can review and approve/reject submissions
-- [ ] Approved submission triggers Stripe payout to gamer
-- [ ] Rejected submission shows rejection reason
-- [ ] End-to-end flow: post bounty → submit clip → approve → payout
+- [ ] `StreamingEncoder` trait defined with comprehensive tests
+- [ ] `FfmpegStreamingEncoder` passes frames and produces valid H.264 chunks
+- [ ] `RingBuffer<EncodedChunk>` correctly evicts old chunks by timestamp
+- [ ] Memory usage at 1080p60/30s stays under 200MB (measured with test)
+- [ ] Save operation concatenates chunks into valid MP4
+- [ ] Thumbnail still generated from first frame (decoded from keyframe or cached)
+- [ ] Fallback to raw RGBA works when FFmpeg unavailable
+- [ ] All existing tests still pass
+- [ ] `cargo test` passes with new encoding pipeline
 
 ---
 
-### Step 8: Clip Replay Viewer (Web)
-**Goal:** Shareable web-based clip viewer with input overlay.
+### Step 8: Bundle FFmpeg as Tauri Sidecar 🔴 CRITICAL
 
-- Web player that renders video with synchronized input overlay
-- Public share links for clips
-- Embeddable player (iframe) for game dev marketing
-- Input visualization: keyboard heatmap, mouse trail, click indicators
+**Problem:** FFmpeg must be in the user's system PATH. Most gamers don't have FFmpeg installed. This kills adoption.
+
+**Solution:** Bundle FFmpeg as a Tauri sidecar binary. Tauri v2 has first-class sidecar support — binaries in `src-tauri/binaries/` are bundled with the app.
+
+**Design:**
+- Download platform-specific FFmpeg static builds (GPL or LGPL depending on license choice)
+- Place in `src-tauri/binaries/ffmpeg-{target_triple}` (Tauri naming convention)
+- Update `find_ffmpeg()` in `encoder.rs` to check sidecar path first (already partially implemented)
+- Update `tauri.conf.json` to declare the sidecar in `bundle.externalBin`
+- Add a build script or Makefile target to download FFmpeg binaries for each platform
+- Document LGPL compliance if using LGPL build
+
+**Files to modify:**
+- `src-tauri/tauri.conf.json` — add `bundle.externalBin` config
+- `clip/encoder.rs` — update `find_ffmpeg()` to use Tauri sidecar API
+- `scripts/download-ffmpeg.sh` — new script to fetch platform binaries
+- `Cargo.toml` — if needed for build script
 
 **Checkpoint 8:**
-- [ ] Public clip URL renders video with input overlay
-- [ ] Input overlay shows keypresses, mouse movement, and clicks in sync
-- [ ] Player works on mobile (responsive)
-- [ ] Embed code generates working iframe
-- [ ] Loading time is <3 seconds for a 30s clip
+- [ ] FFmpeg sidecar binary bundled in dev build
+- [ ] `find_ffmpeg()` resolves sidecar path first
+- [ ] Encoding works with bundled FFmpeg (no system PATH needed)
+- [ ] `pnpm tauri dev` works with sidecar
+- [ ] Download script fetches correct binary per platform
+- [ ] Build size documented (FFmpeg static is ~70-100MB)
+- [ ] All encoder tests pass with sidecar path
 
 ---
 
-## Dev Environment Setup (Mac → Windows)
+### Step 9: Format Versioning + Integrity 🟡 IMPORTANT
 
-**Local (Mac):** Develop UI, backend, business logic, Rust with mocks
-**Remote (AWS g4dn.xlarge):** Test Windows capture engine with real games
+**Problem:** The .gameclip format has no version field and no integrity checks. As the format evolves, old clips may become unreadable. Corrupted clips fail silently.
 
-```
-Mac dev cycle:
-  code → cargo test → pnpm tauri dev (with mocks) → iterate
+**Solution:** Add format version to metadata, SHA-256 checksums for video/audio data, and migration support.
 
-Windows test cycle:
-  cargo xwin build → git push → pull on VM → run .exe → test with game
-```
+**Design:**
+- Add `format_version: u32` to `ClipMetadata` (default 1 for existing clips via `#[serde(default)]`)
+- Add `checksums: HashMap<String, String>` to metadata (e.g., `{"video.bin": "sha256:abc..."}`)
+- Compute checksums during `write_clip()`, verify during `read_clip()`
+- Version 1 = current format, version 2 = with checksums + pre-encoded video
+- `read_clip()` checks version and applies migration if needed
 
-**Cross-compilation setup:**
-```bash
-rustup target add x86_64-pc-windows-msvc
-cargo install cargo-xwin
-cargo xwin build --target x86_64-pc-windows-msvc --release
-```
+**Files to modify:**
+- `clip/metadata.rs` — add `format_version`, `checksums` fields
+- `clip/format.rs` — compute/verify checksums, version check on read
+- Migration functions for v1 → v2
+
+**Checkpoint 9:**
+- [ ] `format_version` field present in all new clips
+- [ ] Old clips (no version) read correctly with default version 1
+- [ ] Checksums computed on write, verified on read
+- [ ] Corrupted clip detected and reported (not silently wrong)
+- [ ] Version migration tested (v1 → v2 roundtrip)
+- [ ] All existing clip tests still pass
 
 ---
 
-## AWS g4dn.xlarge Cost Estimate
+### Step 10: HuggingFace Dataset Upload Pipeline 🟡 IMPORTANT
 
-The g4dn.xlarge provides an NVIDIA T4 GPU for testing the capture engine with real games.
+**Problem:** The HuggingFace export works locally but there's no way to contribute data to a shared dataset. The data flywheel doesn't start until users can easily share annotated clips.
 
-| Option | Approx. Cost | Notes |
-|--------|-------------|-------|
-| On-demand | ~$0.71/hr | Start/stop as needed, pay per hour |
-| Spot instance | ~$0.21/hr | 70% cheaper, can be interrupted |
-| Reserved (1yr) | ~$0.45/hr | Commit for steady use |
+**Solution:** CLI export command + optional upload to a public HuggingFace dataset repo. No accounts, no backend API — just `huggingface_hub` style direct upload.
 
-**Recommended approach:** Use spot instances during development. A typical test session (2-3 hours) costs ~$0.50-0.65. Budget ~$20-30/month for periodic testing.
+**Design:**
+- New Tauri command: `export_to_huggingface` — exports clips to HF format and optionally pushes to a dataset repo
+- Privacy: strip user-identifiable metadata before upload (game window titles, OS username, file paths)
+- Consent: explicit opt-in UI in Settings page with clear data usage explanation
+- Upload: use HuggingFace HTTP API (no Python dependency) to push files to a dataset repo
+- Quality gate: only upload clips with quality score > configurable threshold
+- Batch: upload in background, show progress in UI
+
+**Files to create/modify:**
+- `annotation/upload.rs` — new module for HF HTTP API upload
+- `annotation/privacy.rs` — new module for PII scrubbing
+- `commands.rs` — add `export_to_huggingface` command
+- `engine.rs` — add upload settings to `AppSettings`
+- Frontend: Settings page upload toggle + export dialog
+
+**Checkpoint 10:**
+- [ ] Privacy scrubbing removes file paths, OS usernames, window titles
+- [ ] Local export to HuggingFace format works (already done — verify with new pipeline)
+- [ ] HTTP upload to HuggingFace dataset repo succeeds
+- [ ] Quality gate filters clips below threshold
+- [ ] Upload is async/background with progress reporting
+- [ ] Opt-in consent flow in Settings UI
+- [ ] Round-trip test: export → upload → download → verify data integrity
+
+---
+
+## Future Steps (deferred)
+
+### Step 11: CI/CD Pipeline
+GitHub Actions for Rust tests, clippy, TypeScript check, cross-compilation.
+
+### Step 12: Frontend Tests + Quality Display
+Vitest for React components, quality score badges in ClipCard, annotation viewer in ClipPlayer.
+
+### Step 13: Windows Hardware Testing
+Validate DXGI, Raw Input, WASAPI on real gaming PCs. Fix WASAPI int16 assumption. Anti-cheat compatibility testing.
+
+### Step 14: Backend API
+Node.js + Hono, PostgreSQL, Cloudflare R2. Clip upload/download, user profiles, dataset browsing.
+
+### Step 15: Bounty Marketplace
+Bounty CRUD, submissions, Stripe Connect payouts. Web + desktop bounty browser.
+
+### Step 16: Web Clip Viewer
+Shareable clip URLs, input overlay player, embeddable iframe, mobile responsive.
 
 ---
 
 ## Revenue Streams
 
-1. **Bounty Marketplace** (Step 7) — indie devs pay gamers to clip specific achievements/moments. GameClip takes a platform fee (10-15%).
-2. **AI Training Datasets** — gameplay video + synchronized input data sold to model providers training game-playing AI. The input overlay data is the key differentiator vs plain screen recordings.
+1. **AI Training Datasets** (primary) — the first open collection of frame-action-annotated gameplay. Enterprise API access, curated dataset licensing, custom annotation for game studios.
+2. **Bounty Marketplace** (secondary) — indie devs pay gamers to clip specific achievements. GameClip takes 10-15% platform fee.
 
 ---
 
@@ -317,9 +230,11 @@ The g4dn.xlarge provides an NVIDIA T4 GPU for testing the capture engine with re
 | 2. Platform Abstraction | ✅ Complete | 28 tests |
 | 3. Ring Buffer + Clip Save | ✅ Complete | 23 tests |
 | 4. Clip Library UI | ✅ Complete | TS clean |
-| 5. Windows Capture Engine | 🔧 Code written (untested on Windows) | 6 tests |
-| 6. Backend API | Not started | — |
-| 7. Bounty Marketplace | Not started | — |
-| 8. Web Clip Viewer | Not started | — |
+| 5. Data Annotation Pipeline | ✅ Complete | 51 tests |
+| 6. Windows Capture Engine | 🔧 Partial (untested) | 6 tests |
+| 7. In-Capture Encoding | ⏳ Not started | — |
+| 8. Bundle FFmpeg Sidecar | ⏳ Not started | — |
+| 9. Format Versioning | ⏳ Not started | — |
+| 10. HuggingFace Upload | ⏳ Not started | — |
 
-**Total: 57 passing Rust tests, 0 failures. Clippy clean.**
+**Total: 128 passing Rust tests (1 flaky timing test), 0 frontend tests.**

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useCallback } from "react";
 import { useClips } from "./hooks/useClips";
 import { useSettings } from "./hooks/useSettings";
 import { ClipLibrary } from "./pages/ClipLibrary";
@@ -21,15 +21,15 @@ function App() {
     updateSettings,
   } = useSettings();
 
-  const handleSelectClip = (clip: ClipSummary) => {
+  const handleSelectClip = useCallback((clip: ClipSummary) => {
     setSelectedClip(clip);
     setPage("player");
-  };
+  }, []);
 
-  const handleBack = () => {
+  const handleBack = useCallback(() => {
     setPage("library");
     setSelectedClip(null);
-  };
+  }, []);
 
   return (
     <div className="app">
