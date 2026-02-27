@@ -168,10 +168,17 @@ impl ScreenCapture for MacOSCapture {
             .exclude_windows(&[])
             .build();
 
+        // NOTE: SCStreamConfiguration's minimum_frame_interval is NOT set here.
+        // The screencapturekit v1.1.0 crate has an FFI ABI mismatch: the Rust
+        // FFI declares (i64, i32, u32, i64) parameters but the Swift bridge
+        // expects a single Double (seconds). On arm64, the Double goes to a
+        // float register while Rust sends integers to integer registers, so the
+        // call is silently ignored. SCK therefore delivers at the display refresh
+        // rate (~60fps). The engine's rate-limited push loop in engine.rs handles
+        // this by only pushing frames at target_fps to the encoder.
         let stream_config = SCStreamConfiguration::builder()
             .width(width)
             .height(height)
-            .minimum_frame_interval(9, (config.target_fps * 10) as i32)
             .pixel_format(PixelFormat::BGRA)
             .shows_cursor(true)
             .build();

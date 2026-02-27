@@ -227,8 +227,13 @@ pub fn start_capture(state: &EngineState) -> Result<(), Box<dyn std::error::Erro
         let mut stats_capture_count: u64 = 0;
         let mut stats_push_count: u64 = 0;
         let mut stats_dup_count: u64 = 0;
+        let mut stats_skip_count: u64 = 0;
         let mut last_stats_us: u64 = 0;
         const STATS_INTERVAL_US: u64 = 10_000_000;
+
+        // Session-level totals for shutdown summary
+        let mut session_push_total: u64 = 0;
+        let session_start_us = clock.now_us();
 
         info!(
             "Capture engine started ({}x{} @ {}fps, streaming={}, frame_interval={}us)",
@@ -261,79 +266,65 @@ pub fn start_capture(state: &EngineState) -> Result<(), Box<dyn std::error::Erro
             let real_frame_count = drained_frames.len() as u64;
             stats_capture_count += real_frame_count;
 
-            // Step 2: Feed frames to streaming encoder using two-phase pacing.
+            // Step 2: Feed frames to streaming encoder with rate limiting.
             //
-            // Phase A: Push every real captured frame to the encoder, advancing
-            //          the schedule by one frame interval per push. This ensures
-            //          real motion data is never discarded.
-            // Phase B: If the schedule still demands frames AND no real frames
-            //          were available this iteration, duplicate the last frame
-            //          (static content fill). If real frames were available,
-            //          skip duplication — the schedule will catch up naturally.
+            // SCK may deliver at the display refresh rate (~60fps) due to an FFI
+            // bug that prevents minimum_frame_interval from being applied. The
+            // compute_pacing() function gates pushes to target_fps, using the
+            // latest real frame (or duplicating the last-captured frame for
+            // static content). Excess real frames are skipped, not pushed.
             if streaming_encoder.is_some() {
-                // Store drained frames; keep last for possible duplication
+                // Always keep the latest real frame as the push source
                 if !drained_frames.is_empty() {
-                    // Keep the very last drained frame as the duplication source
                     last_captured_frame = Some(drained_frames.last().unwrap().clone());
                 }
 
                 // Scoped borrow: use enc for push + poll, release before
                 // potential take() in the encoder_dead branch below.
                 if let Some(ref mut enc) = streaming_encoder {
-                    // Initialize schedule on first frame
-                    if !drained_frames.is_empty() && next_encoder_push_us.is_none() {
-                        next_encoder_push_us = Some(now_us);
-                    }
-
-                    // If schedule drifted more than 1 second behind (e.g.,
-                    // system pause), reset to avoid a burst of catch-up frames.
-                    if next_encoder_push_us
-                        .is_some_and(|due| now_us.saturating_sub(due) > 1_000_000)
-                    {
+                    // Unified rate-limited push loop.
+                    //
+                    // Instead of pushing every real frame (Phase A) then
+                    // duplicating (Phase B), we use compute_pacing() to
+                    // decide how many pushes the schedule allows. This
+                    // rate-limits to target_fps regardless of SCK delivery
+                    // rate, fixing the 2x playback speed when SCK delivers
+                    // at 60fps (display refresh rate).
+                    let pacing = compute_pacing(
+                        now_us,
+                        next_encoder_push_us,
+                        last_captured_frame.is_some(),
+                        max_burst,
+                        frame_interval_us,
+                    );
+                    if pacing.was_reset {
                         warn!(
                             "Frame schedule drifted >1s behind, resetting (was {}us behind)",
                             now_us.saturating_sub(
                                 next_encoder_push_us.unwrap_or(now_us)
                             )
                         );
-                        next_encoder_push_us = Some(now_us);
                     }
+                    next_encoder_push_us = pacing.next_due_us;
 
-                    // Phase A: Push every real frame, advancing schedule per push.
-                    for frame in &drained_frames {
-                        if encoder_dead {
-                            break;
-                        }
-                        if let Err(e) = enc.push_frame(frame) {
-                            warn!("Streaming encoder push failed: {e}");
-                            encoder_dead = true;
-                            break;
-                        }
-                        stats_push_count += 1;
-                        next_encoder_push_us =
-                            next_encoder_push_us.map(|d| d + frame_interval_us);
-                    }
-
-                    // Phase B: Duplicate only when no real frames arrived AND
-                    // the schedule demands it (static content fill).
-                    if !encoder_dead && real_frame_count == 0 {
-                        if let Some(ref frame) = last_captured_frame {
-                            let mut dup_pushes = 0u64;
-                            while next_encoder_push_us.is_some_and(|due| due <= now_us)
-                                && dup_pushes < max_burst
-                            {
-                                if let Err(e) = enc.push_frame(frame) {
-                                    warn!("Streaming encoder push failed: {e}");
-                                    encoder_dead = true;
-                                    break;
-                                }
-                                dup_pushes += 1;
-                                stats_push_count += 1;
+                    if let Some(ref frame) = last_captured_frame {
+                        for _ in 0..pacing.pushes {
+                            if let Err(e) = enc.push_frame(frame) {
+                                warn!("Streaming encoder push failed: {e}");
+                                encoder_dead = true;
+                                break;
+                            }
+                            stats_push_count += 1;
+                            if drained_frames.is_empty() {
                                 stats_dup_count += 1;
-                                next_encoder_push_us =
-                                    next_encoder_push_us.map(|d| d + frame_interval_us);
                             }
                         }
+                    }
+
+                    // Track real frames skipped due to rate limiting:
+                    // we only use the latest of N real frames per iteration.
+                    if real_frame_count > 1 {
+                        stats_skip_count += real_frame_count - 1;
                     }
 
                     if !encoder_dead && encoder_ts_offset.is_none() {
@@ -427,22 +418,27 @@ pub fn start_capture(state: &EngineState) -> Result<(), Box<dyn std::error::Erro
             // Periodic capture rate diagnostics
             if now_us.saturating_sub(last_stats_us) >= STATS_INTERVAL_US && last_stats_us > 0 {
                 let elapsed = (now_us - last_stats_us) as f64 / 1_000_000.0;
+                let expected_frames = elapsed * settings.capture_fps as f64;
+                let pacing_ratio = if expected_frames > 0.0 {
+                    stats_push_count as f64 / expected_frames
+                } else {
+                    0.0
+                };
                 info!(
                     "Capture stats: capture={:.1}fps, encoder_push={:.1}fps (target={}fps), \
-                     duplicated={} frames ({:.0}%)",
+                     skipped={}, duplicated={}, pacing_ratio={:.3}",
                     stats_capture_count as f64 / elapsed,
                     stats_push_count as f64 / elapsed,
                     settings.capture_fps,
+                    stats_skip_count,
                     stats_dup_count,
-                    if stats_push_count > 0 {
-                        stats_dup_count as f64 / stats_push_count as f64 * 100.0
-                    } else {
-                        0.0
-                    },
+                    pacing_ratio,
                 );
+                session_push_total += stats_push_count;
                 stats_capture_count = 0;
                 stats_push_count = 0;
                 stats_dup_count = 0;
+                stats_skip_count = 0;
                 last_stats_us = now_us;
             } else if last_stats_us == 0 {
                 last_stats_us = now_us;
@@ -452,6 +448,28 @@ pub fn start_capture(state: &EngineState) -> Result<(), Box<dyn std::error::Erro
         }
 
         // Clean shutdown — log session stats
+        // Include any un-flushed stats from the last partial interval
+        session_push_total += stats_push_count;
+
+        let session_elapsed = clock.now_us().saturating_sub(session_start_us) as f64 / 1_000_000.0;
+        if session_elapsed > 0.0 {
+            let expected = session_elapsed * settings.capture_fps as f64;
+            let session_ratio = if expected > 0.0 {
+                session_push_total as f64 / expected
+            } else {
+                0.0
+            };
+            info!(
+                "Session summary: {session_push_total} frames pushed in {session_elapsed:.1}s, \
+                 pacing_ratio={session_ratio:.3}"
+            );
+            if session_ratio > 1.01 {
+                warn!(
+                    "Session pacing ratio {session_ratio:.3} > 1.01 — video may play slower than real-time"
+                );
+            }
+        }
+
         if let Some(mut enc) = streaming_encoder {
             let dropped = enc.dropped_frame_count();
             if dropped > 0 {
@@ -470,6 +488,78 @@ pub fn start_capture(state: &EngineState) -> Result<(), Box<dyn std::error::Erro
     });
 
     Ok(())
+}
+
+/// Result of the per-iteration pacing computation.
+#[derive(Debug, PartialEq)]
+struct PacingResult {
+    /// Number of frames to push to the encoder this iteration.
+    pushes: u64,
+    /// Updated schedule timestamp (next push due time).
+    next_due_us: Option<u64>,
+    /// Whether the schedule was reset due to excessive drift (>1s behind).
+    was_reset: bool,
+}
+
+/// Compute how many frames to push to the encoder this iteration.
+///
+/// Rate-limits encoder pushes to the target fps regardless of capture source
+/// delivery rate. Uses a schedule-based approach: pushes are only allowed
+/// when wall-clock time has advanced past `next_due_us`.
+///
+/// - `now_us`: current wall-clock time in microseconds
+/// - `next_due_us`: when the next push is scheduled (None = uninitialized)
+/// - `has_frame`: whether a frame is available to push (real or last-captured)
+/// - `max_burst`: max pushes per iteration to prevent encoder overload
+/// - `frame_interval_us`: target interval between pushes (1_000_000 / fps)
+fn compute_pacing(
+    now_us: u64,
+    next_due_us: Option<u64>,
+    has_frame: bool,
+    max_burst: u64,
+    frame_interval_us: u64,
+) -> PacingResult {
+    // Can't push without a frame (real or last-captured)
+    if !has_frame {
+        return PacingResult {
+            pushes: 0,
+            next_due_us,
+            was_reset: false,
+        };
+    }
+
+    // Initialize schedule on first available frame
+    let due = match next_due_us {
+        Some(d) => d,
+        None => {
+            return PacingResult {
+                pushes: 1,
+                next_due_us: Some(now_us + frame_interval_us),
+                was_reset: false,
+            };
+        }
+    };
+
+    // Reset if schedule drifted > 1 second behind wall time
+    let (due, was_reset) = if now_us.saturating_sub(due) > 1_000_000 {
+        (now_us, true)
+    } else {
+        (due, false)
+    };
+
+    // Count how many pushes the schedule allows right now
+    let mut pushes = 0u64;
+    let mut next = due;
+    while next <= now_us && pushes < max_burst {
+        pushes += 1;
+        next += frame_interval_us;
+    }
+
+    PacingResult {
+        pushes,
+        next_due_us: Some(next),
+        was_reset,
+    }
 }
 
 /// Lock the saver mutex, recovering from poison if necessary.
@@ -532,4 +622,158 @@ pub fn save_clip(saver: &Arc<Mutex<ClipSaver>>) -> Result<PathBuf, String> {
 /// on all platforms.
 fn detect_current_game() -> Option<String> {
     crate::game::detector::detect_current_game()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TARGET_FPS: u64 = 30;
+    const FRAME_INTERVAL_US: u64 = 1_000_000 / TARGET_FPS; // 33_333
+    const MAX_BURST: u64 = 6; // (30 / 5).max(2)
+
+    #[test]
+    fn rate_limiter_caps_pushes_at_target_fps() {
+        // Simulate 60fps capture with 30fps target over 10 seconds.
+        // The rate limiter should cap pushes to ~300, not pass all 600 through.
+        let capture_fps = 60u64;
+        let duration_secs = 10u64;
+        let total_captured = capture_fps * duration_secs;
+        let capture_interval_us = 1_000_000 / capture_fps;
+
+        let mut next_due: Option<u64> = None;
+        let mut total_pushes = 0u64;
+
+        for i in 0..total_captured {
+            let now_us = i * capture_interval_us;
+            let result =
+                compute_pacing(now_us, next_due, true, MAX_BURST, FRAME_INTERVAL_US);
+            total_pushes += result.pushes;
+            next_due = result.next_due_us;
+        }
+
+        let expected = TARGET_FPS * duration_secs; // 300
+        assert!(
+            total_pushes >= expected - 10 && total_pushes <= expected + 10,
+            "Expected ~{expected} pushes at 30fps over 10s, got {total_pushes} \
+             (ratio: {:.3})",
+            total_pushes as f64 / expected as f64,
+        );
+    }
+
+    #[test]
+    fn rate_limiter_allows_exact_rate() {
+        // Capture at exactly target fps — all frames should be pushed.
+        let duration_secs = 10u64;
+        let total_captured = TARGET_FPS * duration_secs;
+
+        let mut next_due: Option<u64> = None;
+        let mut total_pushes = 0u64;
+
+        for i in 0..total_captured {
+            let now_us = i * FRAME_INTERVAL_US;
+            let result =
+                compute_pacing(now_us, next_due, true, MAX_BURST, FRAME_INTERVAL_US);
+            total_pushes += result.pushes;
+            next_due = result.next_due_us;
+        }
+
+        let expected = TARGET_FPS * duration_secs; // 300
+        assert!(
+            total_pushes >= expected - 2 && total_pushes <= expected + 2,
+            "Expected ~{expected} pushes at exact target rate, got {total_pushes}",
+        );
+    }
+
+    #[test]
+    fn rate_limiter_duplicates_for_static_content() {
+        // Simulate: 1 real frame at t=0, then no real frames for 1 second.
+        // The limiter should allow ~30 pushes (duplicates) over that second.
+        let first = compute_pacing(0, None, true, MAX_BURST, FRAME_INTERVAL_US);
+        assert_eq!(first.pushes, 1, "First frame should produce 1 push");
+        let mut next_due = first.next_due_us;
+        let mut total_pushes = first.pushes;
+
+        // Simulate polling every 2ms for 1 second, with a frame always available
+        // (last_captured_frame exists) but no new real frames.
+        let poll_interval_us = 2_000u64;
+        let iterations = 1_000_000 / poll_interval_us;
+        for i in 1..=iterations {
+            let now_us = i * poll_interval_us;
+            let result =
+                compute_pacing(now_us, next_due, true, MAX_BURST, FRAME_INTERVAL_US);
+            total_pushes += result.pushes;
+            next_due = result.next_due_us;
+        }
+
+        // Should be ~30 pushes (1 real + ~29 duplicates)
+        assert!(
+            total_pushes >= 28 && total_pushes <= 32,
+            "Expected ~30 pushes over 1s of static content, got {total_pushes}",
+        );
+    }
+
+    #[test]
+    fn rate_limiter_resets_on_drift() {
+        // Start normally, then jump 2 seconds forward (simulating system pause).
+        let first = compute_pacing(0, None, true, MAX_BURST, FRAME_INTERVAL_US);
+        let next_due = first.next_due_us;
+
+        // Jump 2 seconds into the future — should trigger drift reset, not
+        // produce a burst of 60 catch-up frames.
+        let result = compute_pacing(
+            2_000_000,
+            next_due,
+            true,
+            MAX_BURST,
+            FRAME_INTERVAL_US,
+        );
+        assert!(result.was_reset, "Should detect >1s drift and reset");
+        assert!(
+            result.pushes <= MAX_BURST,
+            "After drift reset, pushes ({}) should be <= max_burst ({})",
+            result.pushes,
+            MAX_BURST,
+        );
+    }
+
+    #[test]
+    fn rate_limiter_no_pushes_without_frame() {
+        // No frame available — should never push regardless of schedule.
+        let result = compute_pacing(100_000, Some(0), false, MAX_BURST, FRAME_INTERVAL_US);
+        assert_eq!(result.pushes, 0);
+        // Schedule should be preserved for when a frame becomes available
+        assert_eq!(result.next_due_us, Some(0));
+    }
+
+    #[test]
+    fn rate_limiter_initializes_on_first_frame() {
+        // First call with no schedule should initialize and push 1 frame.
+        let result = compute_pacing(50_000, None, true, MAX_BURST, FRAME_INTERVAL_US);
+        assert_eq!(result.pushes, 1);
+        assert_eq!(result.next_due_us, Some(50_000 + FRAME_INTERVAL_US));
+        assert!(!result.was_reset);
+    }
+
+    #[test]
+    fn rate_limiter_no_init_without_frame() {
+        // No frame and no schedule — should not initialize.
+        let result = compute_pacing(50_000, None, false, MAX_BURST, FRAME_INTERVAL_US);
+        assert_eq!(result.pushes, 0);
+        assert_eq!(result.next_due_us, None);
+    }
+
+    #[test]
+    fn rate_limiter_burst_cap_enforced() {
+        // Schedule is 500ms behind (15 frames due) but max_burst=6.
+        let due_us = 0u64;
+        let now_us = 500_000; // 500ms later, within 1s drift threshold
+        let result =
+            compute_pacing(now_us, Some(due_us), true, MAX_BURST, FRAME_INTERVAL_US);
+        assert_eq!(
+            result.pushes, MAX_BURST,
+            "Should cap at max_burst={MAX_BURST}, not push all 15 due frames",
+        );
+        assert!(!result.was_reset);
+    }
 }
