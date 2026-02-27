@@ -8,6 +8,19 @@ pub mod macos;
 
 use crate::sync::clock::TimestampUs;
 
+/// Pixel format of the raw frame data.
+///
+/// Platform capture APIs deliver frames in their native format (BGRA on macOS/Windows).
+/// Carrying the format tag avoids per-frame pixel swizzling on the capture hot path;
+/// downstream consumers (FFmpeg, thumbnail) handle the format as needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FramePixelFormat {
+    /// Red-Green-Blue-Alpha (mock capture, raw fallback).
+    Rgba,
+    /// Blue-Green-Red-Alpha (native macOS ScreenCaptureKit / Windows DXGI).
+    Bgra,
+}
+
 /// A single captured video frame with its timestamp and pixel data.
 #[derive(Debug, Clone)]
 pub struct CapturedFrame {
@@ -17,8 +30,10 @@ pub struct CapturedFrame {
     pub width: u32,
     /// Frame height in pixels.
     pub height: u32,
-    /// Raw RGBA pixel data (width * height * 4 bytes).
+    /// Raw pixel data (width * height * 4 bytes). Layout described by `pixel_format`.
     pub data: Vec<u8>,
+    /// Pixel format of `data`.
+    pub pixel_format: FramePixelFormat,
 }
 
 /// Error type for screen capture operations.

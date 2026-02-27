@@ -1,4 +1,4 @@
-use super::{CaptureConfig, CaptureError, CapturedFrame, ScreenCapture};
+use super::{CaptureConfig, CaptureError, CapturedFrame, FramePixelFormat, ScreenCapture};
 use crate::sync::clock::SyncClock;
 use log::{error, info, warn};
 use screencapturekit::prelude::*;
@@ -81,7 +81,9 @@ impl SCStreamOutputTrait for FrameHandler {
         }
 
         // Copy pixel data, stripping any row padding from GPU alignment.
-        // ScreenCaptureKit delivers BGRA; we convert to RGBA in-place.
+        // ScreenCaptureKit delivers native BGRA — we keep it as-is to avoid
+        // per-frame swizzling on the capture hot path. Downstream consumers
+        // (FFmpeg, thumbnail) handle the pixel format via the tag.
         let row_bytes = (width as usize) * 4;
         let mut data = Vec::with_capacity(row_bytes * height as usize);
 
@@ -94,16 +96,12 @@ impl SCStreamOutputTrait for FrameHandler {
             data.extend_from_slice(&slice[row_start..row_end]);
         }
 
-        // BGRA → RGBA: swap B and R channels
-        for pixel in data.chunks_exact_mut(4) {
-            pixel.swap(0, 2);
-        }
-
         let frame = CapturedFrame {
             timestamp_us: self.clock.now_us(),
             width,
             height,
             data,
+            pixel_format: FramePixelFormat::Bgra,
         };
 
         if let Ok(mut buf) = self.buffer.lock() {
@@ -173,7 +171,7 @@ impl ScreenCapture for MacOSCapture {
         let stream_config = SCStreamConfiguration::builder()
             .width(width)
             .height(height)
-            .minimum_frame_interval(1, config.target_fps as i32)
+            .minimum_frame_interval(9, (config.target_fps * 10) as i32)
             .pixel_format(PixelFormat::BGRA)
             .shows_cursor(true)
             .build();
@@ -237,21 +235,15 @@ impl ScreenCapture for MacOSCapture {
             return Err(CaptureError::NotStarted);
         }
 
-        // ScreenCaptureKit's minimum_frame_interval already rate-limits delivery,
-        // so no software rate-limiter needed here.
+        // Return frames in FIFO order so the engine can drain all buffered
+        // frames per iteration. The MAX_BUFFERED_FRAMES cap in the SCK callback
+        // provides backpressure; discarding here would lose real motion data.
 
         let mut buf = self
             .frame_buffer
             .lock()
             .map_err(|e| CaptureError::Platform(format!("Buffer lock poisoned: {e}")))?;
 
-        // Take the most recent frame, discard older ones
-        if buf.len() > 1 {
-            let latest = buf.pop_back();
-            buf.clear();
-            Ok(latest)
-        } else {
-            Ok(buf.pop_front())
-        }
+        Ok(buf.pop_front())
     }
 }

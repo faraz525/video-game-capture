@@ -1,4 +1,4 @@
-use crate::capture::CapturedFrame;
+use crate::capture::{CapturedFrame, FramePixelFormat};
 use crate::sync::encoded_ring_buffer::{ChunkType, EncodedChunk};
 use log::{debug, info, warn};
 use std::io::{Read, Write};
@@ -32,6 +32,8 @@ pub struct StreamingConfig {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
+    /// Input pixel format. Determines FFmpeg's `-pix_fmt` input flag.
+    pub pixel_format: FramePixelFormat,
 }
 
 /// Trait for streaming video encoders that accept raw frames and produce
@@ -326,12 +328,16 @@ fn start_ffmpeg_process(
     StreamingEncoderError,
 > {
     let gop_size = (config.fps * GOP_MULTIPLIER).to_string();
+    let input_pix_fmt = match config.pixel_format {
+        FramePixelFormat::Bgra => "bgra",
+        FramePixelFormat::Rgba => "rgba",
+    };
 
     let mut cmd = Command::new(ffmpeg_path);
     cmd.args([
         "-y",
         "-f", "rawvideo",
-        "-pix_fmt", "rgba",
+        "-pix_fmt", input_pix_fmt,
         "-s", &format!("{}x{}", config.width, config.height),
         "-r", &config.fps.to_string(),
         "-i", "pipe:0",
@@ -565,6 +571,7 @@ mod tests {
             width: 64,
             height: 64,
             fps: 30,
+            pixel_format: FramePixelFormat::Rgba,
         };
 
         encoder.start(config).unwrap();
@@ -587,6 +594,7 @@ mod tests {
             width: 64,
             height: 64,
             fps: 30,
+            pixel_format: FramePixelFormat::Rgba,
         };
         encoder.start(config).unwrap();
 
@@ -598,6 +606,7 @@ mod tests {
                 width: 64,
                 height: 64,
                 data: vec![255, 0, 0, 255].repeat(64 * 64),
+                pixel_format: FramePixelFormat::Rgba,
             };
             if encoder.push_frame(&frame).is_err() {
                 break;
@@ -634,6 +643,7 @@ mod tests {
             width: 64,
             height: 64,
             fps: 30,
+            pixel_format: FramePixelFormat::Rgba,
         };
         encoder.start(config).unwrap();
 
@@ -645,6 +655,7 @@ mod tests {
                 width: 64,
                 height: 64,
                 data: vec![255, 0, 0, 255].repeat(64 * 64),
+                pixel_format: FramePixelFormat::Rgba,
             };
             if encoder.push_frame(&frame).is_err() {
                 break;
@@ -706,6 +717,7 @@ mod tests {
             width: 64,
             height: 64,
             fps: 30,
+            pixel_format: FramePixelFormat::Rgba,
         };
         let result = encoder.start(config);
 

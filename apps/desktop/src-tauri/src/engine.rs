@@ -1,6 +1,6 @@
 use crate::audio::AudioCapture;
 use crate::audio::AudioConfig;
-use crate::capture::{CaptureConfig, CapturedFrame, ScreenCapture};
+use crate::capture::{CaptureConfig, CapturedFrame, FramePixelFormat, ScreenCapture};
 use crate::clip::saver::{ClipSaver, EncodedVideoData};
 use crate::clip::streaming::{FfmpegStreamingEncoder, StreamingConfig, StreamingEncoder};
 use crate::input::InputRecorder;
@@ -13,7 +13,7 @@ use std::thread;
 use std::time::Duration;
 
 const DEFAULT_BUFFER_SECS: u32 = 30;
-const POLL_INTERVAL_MS: u64 = 5;
+const POLL_INTERVAL_MS: u64 = 2;
 
 /// Application-wide capture engine state, shared across threads.
 pub struct EngineState {
@@ -90,6 +90,17 @@ fn create_input_recorder(clock: SyncClock) -> Box<dyn InputRecorder> {
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn create_input_recorder(clock: SyncClock) -> Box<dyn InputRecorder> {
     Box::new(crate::input::mock::MockInputRecorder::new(clock))
+}
+
+/// Returns the native pixel format for the current platform's capture backend.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn platform_pixel_format() -> FramePixelFormat {
+    FramePixelFormat::Bgra
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn platform_pixel_format() -> FramePixelFormat {
+    FramePixelFormat::Rgba
 }
 
 /// Create the platform-appropriate audio capture implementation.
@@ -172,6 +183,7 @@ pub fn start_capture(state: &EngineState) -> Result<(), Box<dyn std::error::Erro
                 width: settings.capture_width,
                 height: settings.capture_height,
                 fps: settings.capture_fps,
+                pixel_format: platform_pixel_format(),
             };
             match enc.start(streaming_config) {
                 Ok(()) => {
@@ -232,67 +244,100 @@ pub fn start_capture(state: &EngineState) -> Result<(), Box<dyn std::error::Erro
             let mut pending_chunks = Vec::new();
             let mut encoder_dead = false;
 
-            // Step 1: Poll for new capture frame (single poll per iteration)
-            let new_frame = screen.poll_frame().ok().flatten();
-            let got_new_frame = new_frame.is_some();
-            if got_new_frame {
-                stats_capture_count += 1;
+            // Step 1: Drain ALL available frames from capture source (FIFO).
+            // Previous design polled once per iteration, losing real frames
+            // that piled up in the buffer between 5ms sleeps.
+            let mut drained_frames: Vec<CapturedFrame> = Vec::new();
+            loop {
+                match screen.poll_frame() {
+                    Ok(Some(frame)) => drained_frames.push(frame),
+                    Ok(None) => break,
+                    Err(e) => {
+                        warn!("Screen poll error: {e}");
+                        break;
+                    }
+                }
             }
+            let real_frame_count = drained_frames.len() as u64;
+            stats_capture_count += real_frame_count;
 
-            // Step 2: Feed frames to streaming encoder on schedule
+            // Step 2: Feed frames to streaming encoder using two-phase pacing.
+            //
+            // Phase A: Push every real captured frame to the encoder, advancing
+            //          the schedule by one frame interval per push. This ensures
+            //          real motion data is never discarded.
+            // Phase B: If the schedule still demands frames AND no real frames
+            //          were available this iteration, duplicate the last frame
+            //          (static content fill). If real frames were available,
+            //          skip duplication — the schedule will catch up naturally.
             if streaming_encoder.is_some() {
-                // Store new frame for pacing (encoder path keeps last frame
-                // for duplication when capture rate < target fps)
-                if let Some(frame) = new_frame {
-                    last_captured_frame = Some(frame);
+                // Store drained frames; keep last for possible duplication
+                if !drained_frames.is_empty() {
+                    // Keep the very last drained frame as the duplication source
+                    last_captured_frame = Some(drained_frames.last().unwrap().clone());
                 }
 
                 // Scoped borrow: use enc for push + poll, release before
                 // potential take() in the encoder_dead branch below.
                 if let Some(ref mut enc) = streaming_encoder {
-                    if let Some(ref frame) = last_captured_frame {
-                        // Initialize schedule on first frame
-                        if next_encoder_push_us.is_none() {
-                            next_encoder_push_us = Some(now_us);
-                        }
+                    // Initialize schedule on first frame
+                    if !drained_frames.is_empty() && next_encoder_push_us.is_none() {
+                        next_encoder_push_us = Some(now_us);
+                    }
 
-                        // If schedule drifted more than 1 second behind (e.g.,
-                        // system pause), reset to avoid a burst of catch-up frames
-                        // that would just get dropped by encoder backpressure.
-                        if next_encoder_push_us
-                            .is_some_and(|due| now_us.saturating_sub(due) > 1_000_000)
-                        {
-                            warn!(
-                                "Frame schedule drifted >1s behind, resetting (was {}us behind)",
-                                now_us.saturating_sub(
-                                    next_encoder_push_us.unwrap_or(now_us)
-                                )
-                            );
-                            next_encoder_push_us = Some(now_us);
-                        }
+                    // If schedule drifted more than 1 second behind (e.g.,
+                    // system pause), reset to avoid a burst of catch-up frames.
+                    if next_encoder_push_us
+                        .is_some_and(|due| now_us.saturating_sub(due) > 1_000_000)
+                    {
+                        warn!(
+                            "Frame schedule drifted >1s behind, resetting (was {}us behind)",
+                            now_us.saturating_sub(
+                                next_encoder_push_us.unwrap_or(now_us)
+                            )
+                        );
+                        next_encoder_push_us = Some(now_us);
+                    }
 
-                        // Push frames to maintain target fps
-                        let mut pushes = 0u64;
-                        while next_encoder_push_us.is_some_and(|due| due <= now_us)
-                            && pushes < max_burst
-                        {
-                            if let Err(e) = enc.push_frame(frame) {
-                                warn!("Streaming encoder push failed: {e}");
-                                encoder_dead = true;
-                                break;
-                            }
-                            pushes += 1;
-                            stats_push_count += 1;
-                            if pushes > 1 || !got_new_frame {
+                    // Phase A: Push every real frame, advancing schedule per push.
+                    for frame in &drained_frames {
+                        if encoder_dead {
+                            break;
+                        }
+                        if let Err(e) = enc.push_frame(frame) {
+                            warn!("Streaming encoder push failed: {e}");
+                            encoder_dead = true;
+                            break;
+                        }
+                        stats_push_count += 1;
+                        next_encoder_push_us =
+                            next_encoder_push_us.map(|d| d + frame_interval_us);
+                    }
+
+                    // Phase B: Duplicate only when no real frames arrived AND
+                    // the schedule demands it (static content fill).
+                    if !encoder_dead && real_frame_count == 0 {
+                        if let Some(ref frame) = last_captured_frame {
+                            let mut dup_pushes = 0u64;
+                            while next_encoder_push_us.is_some_and(|due| due <= now_us)
+                                && dup_pushes < max_burst
+                            {
+                                if let Err(e) = enc.push_frame(frame) {
+                                    warn!("Streaming encoder push failed: {e}");
+                                    encoder_dead = true;
+                                    break;
+                                }
+                                dup_pushes += 1;
+                                stats_push_count += 1;
                                 stats_dup_count += 1;
+                                next_encoder_push_us =
+                                    next_encoder_push_us.map(|d| d + frame_interval_us);
                             }
-                            next_encoder_push_us =
-                                next_encoder_push_us.map(|d| d + frame_interval_us);
                         }
+                    }
 
-                        if !encoder_dead && encoder_ts_offset.is_none() {
-                            encoder_ts_offset = enc.first_frame_timestamp_us();
-                        }
+                    if !encoder_dead && encoder_ts_offset.is_none() {
+                        encoder_ts_offset = enc.first_frame_timestamp_us();
                     }
 
                     // Poll all available encoded chunks and offset timestamps
@@ -340,10 +385,10 @@ pub fn start_capture(state: &EngineState) -> Result<(), Box<dyn std::error::Erro
                     }
                 } else {
                     // Cache thumbnail on new frames, push encoded chunks
-                    let needs_lock = got_new_frame || !pending_chunks.is_empty();
+                    let needs_lock = real_frame_count > 0 || !pending_chunks.is_empty();
                     if needs_lock {
                         let mut s = lock_or_recover(&saver);
-                        if got_new_frame {
+                        if real_frame_count > 0 {
                             if let Some(ref frame) = last_captured_frame {
                                 s.cache_first_raw_frame(frame.clone());
                             }
@@ -353,10 +398,14 @@ pub fn start_capture(state: &EngineState) -> Result<(), Box<dyn std::error::Erro
                         }
                     }
                 }
-            } else if let Some(frame) = new_frame {
-                // No streaming encoder — push new frame directly to raw buffer
-                let mut s = lock_or_recover(&saver);
-                s.push_frame(frame);
+            } else {
+                // No streaming encoder — push all drained frames to raw buffer
+                if !drained_frames.is_empty() {
+                    let mut s = lock_or_recover(&saver);
+                    for frame in drained_frames {
+                        s.push_frame(frame);
+                    }
+                }
             }
 
             if input_active {

@@ -1,3 +1,4 @@
+use crate::capture::FramePixelFormat;
 use log::{debug, info, warn};
 use std::io::Write;
 use std::path::Path;
@@ -27,13 +28,15 @@ pub struct FfmpegEncoder {
 impl FfmpegEncoder {
     /// Start an FFmpeg encoding process.
     ///
-    /// The encoder accepts raw RGBA frames via stdin and produces an MP4 file.
+    /// The encoder accepts raw frames via stdin and produces an MP4 file.
+    /// `pixel_format` determines the FFmpeg `-pix_fmt` input flag.
     /// Codec priority: VideoToolbox (macOS) → NVENC (Windows) → libx264 (fallback).
     pub fn start(
         output_path: &Path,
         width: u32,
         height: u32,
         fps: u32,
+        pixel_format: FramePixelFormat,
     ) -> Result<Self, EncoderError> {
         let ffmpeg_path = find_ffmpeg()?;
         info!("FFmpeg found at: {ffmpeg_path}");
@@ -62,6 +65,7 @@ impl FfmpegEncoder {
                 fps,
                 codec,
                 codec_args,
+                pixel_format,
             ) {
                 Ok(encoder) => return Ok(encoder),
                 Err(e) => {
@@ -76,6 +80,7 @@ impl FfmpegEncoder {
         }))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn start_with_codec(
         ffmpeg_path: &str,
         output_path: &Path,
@@ -84,12 +89,17 @@ impl FfmpegEncoder {
         fps: u32,
         codec: &str,
         codec_args: &[&str],
+        pixel_format: FramePixelFormat,
     ) -> Result<Self, EncoderError> {
+        let input_pix_fmt = match pixel_format {
+            FramePixelFormat::Bgra => "bgra",
+            FramePixelFormat::Rgba => "rgba",
+        };
         let mut cmd = Command::new(ffmpeg_path);
         cmd.args([
             "-y",
             "-f", "rawvideo",
-            "-pix_fmt", "rgba",
+            "-pix_fmt", input_pix_fmt,
             "-s", &format!("{width}x{height}"),
             "-r", &fps.to_string(),
             "-i", "pipe:0",
@@ -246,10 +256,10 @@ pub(crate) fn find_ffmpeg() -> Result<String, EncoderError> {
     }
 }
 
-/// Encode raw RGBA frames into an MP4 file using FFmpeg.
+/// Encode raw frames into an MP4 file using FFmpeg.
 ///
-/// Pipes RGBA frame data directly to FFmpeg (which is configured with
-/// `-pix_fmt rgba` input). No pixel format conversion needed.
+/// Reads the pixel format from the first frame and configures FFmpeg's
+/// `-pix_fmt` input flag accordingly (rgba or bgra).
 pub fn encode_frames_to_mp4(
     frames: &[crate::capture::CapturedFrame],
     fps: u32,
@@ -260,14 +270,15 @@ pub fn encode_frames_to_mp4(
 
     let width = frames[0].width;
     let height = frames[0].height;
+    let pixel_format = frames[0].pixel_format;
     let frame_count = frames.len();
 
-    info!("Encoding {frame_count} frames ({width}x{height} @ {fps}fps)");
+    info!("Encoding {frame_count} frames ({width}x{height} @ {fps}fps, {pixel_format:?})");
 
     let temp_dir = tempfile::TempDir::new()?;
     let output_path = temp_dir.path().join("clip.mp4");
 
-    let mut encoder = FfmpegEncoder::start(&output_path, width, height, fps)?;
+    let mut encoder = FfmpegEncoder::start(&output_path, width, height, fps, pixel_format)?;
 
     for (i, frame) in frames.iter().enumerate() {
         if let Err(e) = encoder.write_frame(&frame.data) {
@@ -284,17 +295,19 @@ pub fn encode_frames_to_mp4(
     Ok(mp4_data)
 }
 
-/// Re-encode raw RGBA frame data into an MP4 file.
+/// Re-encode raw frame data into an MP4 file.
 ///
-/// Used to convert clips that were saved with the raw RGBA fallback
+/// Used to convert clips that were saved with the raw fallback
 /// into playable MP4 video. The raw data is expected to be a sequence
-/// of RGBA frames of the given dimensions.
+/// of frames of the given dimensions in the specified pixel format.
 pub fn reencode_raw_to_mp4(
     raw_data: &[u8],
     width: u32,
     height: u32,
     fps: u32,
 ) -> Result<Vec<u8>, EncoderError> {
+    // Legacy raw clips are always RGBA (the old code converted to RGBA before saving)
+    let pixel_format = FramePixelFormat::Rgba;
     let frame_size = (width * height * 4) as usize;
     if raw_data.is_empty() || frame_size == 0 {
         return Err(EncoderError::EncodingFailed("no data to re-encode".to_string()));
@@ -314,7 +327,7 @@ pub fn reencode_raw_to_mp4(
     let temp_dir = tempfile::TempDir::new()?;
     let output_path = temp_dir.path().join("clip.mp4");
 
-    let mut encoder = FfmpegEncoder::start(&output_path, width, height, fps)?;
+    let mut encoder = FfmpegEncoder::start(&output_path, width, height, fps, pixel_format)?;
 
     for i in 0..frame_count {
         let start = i * frame_size;

@@ -186,6 +186,7 @@ mod tests {
             width: 4,
             height: 4,
             data: vec![255, 0, 0, 255].repeat(16),
+            pixel_format: crate::capture::FramePixelFormat::Rgba,
         }
     }
 

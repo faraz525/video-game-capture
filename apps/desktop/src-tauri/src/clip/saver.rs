@@ -2,7 +2,7 @@ use super::format::{write_clip, ClipPackageData};
 use super::metadata::{CaptureDevices, ClipMetadata};
 use crate::annotation;
 use crate::audio::AudioBuffer;
-use crate::capture::CapturedFrame;
+use crate::capture::{CapturedFrame, FramePixelFormat};
 use crate::input::InputEvent;
 use crate::sync::encoded_ring_buffer::{EncodedChunk, EncodedRingBuffer};
 use crate::sync::ring_buffer::{RingBuffer, Timestamped};
@@ -392,13 +392,25 @@ const THUMBNAIL_JPEG_QUALITY: u8 = 80;
 /// Generate a JPEG thumbnail from a captured frame.
 ///
 /// Resizes the frame to `THUMBNAIL_WIDTH` pixels wide (maintaining aspect ratio)
-/// and encodes as JPEG.
+/// and encodes as JPEG. Handles both RGBA and BGRA pixel formats.
 fn generate_thumbnail(frame: &CapturedFrame) -> Vec<u8> {
     use image::{ImageBuffer, RgbaImage};
     use std::io::Cursor;
 
+    // Convert BGRA → RGBA for the image crate (one-time copy per clip save).
+    let rgba_data = match frame.pixel_format {
+        FramePixelFormat::Bgra => {
+            let mut data = frame.data.clone();
+            for pixel in data.chunks_exact_mut(4) {
+                pixel.swap(0, 2);
+            }
+            data
+        }
+        FramePixelFormat::Rgba => frame.data.clone(),
+    };
+
     let img: Option<RgbaImage> =
-        ImageBuffer::from_raw(frame.width, frame.height, frame.data.clone());
+        ImageBuffer::from_raw(frame.width, frame.height, rgba_data);
 
     let Some(img) = img else {
         return Vec::new();
@@ -452,6 +464,7 @@ mod tests {
             width: 4,
             height: 4,
             data: vec![255, 0, 0, 255].repeat(16), // 4x4 red
+            pixel_format: FramePixelFormat::Rgba,
         }
     }
 
@@ -589,6 +602,7 @@ mod tests {
                 width: 640,
                 height: 360,
                 data: vec![255, 0, 0, 255].repeat(640 * 360), // solid red
+                pixel_format: FramePixelFormat::Rgba,
             });
             saver.push_input(make_key_event(ts, "KeyW", i % 2 == 0));
         }
