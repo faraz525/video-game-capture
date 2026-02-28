@@ -163,8 +163,16 @@ pub fn write_clip_with_options(
         ..data.metadata.clone()
     };
 
-    // Now write the zip
-    let file = File::create(path)?;
+    // Write to a temporary file in the same directory, then atomically rename.
+    // This prevents list_clips from seeing a partial zip (missing EOCD)
+    // when a concurrent save triggers a UI refresh mid-write.
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let temp_path = parent.join(format!(
+        ".tmp_{}.gameclip",
+        std::process::id()
+    ));
+
+    let file = File::create(&temp_path)?;
     let mut zip = ZipWriter::new(file);
     let zip_options = FileOptions::<()>::default()
         .compression_method(zip::CompressionMethod::Deflated);
@@ -202,6 +210,9 @@ pub fn write_clip_with_options(
     zip.write_all(metadata_json.as_bytes())?;
 
     zip.finish()?;
+
+    // Atomic rename: list_clips only ever sees a complete .gameclip file
+    std::fs::rename(&temp_path, path)?;
     Ok(())
 }
 

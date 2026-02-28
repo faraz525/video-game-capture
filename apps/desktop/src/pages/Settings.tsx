@@ -25,7 +25,25 @@ export function SettingsPage({
     }
   }, [settings]);
 
-  if (loading || !draft) {
+  if (loading) {
+    return <div className="loading">Loading settings...</div>;
+  }
+
+  if (error && !draft) {
+    return (
+      <div className="settings-page">
+        <div className="settings-header">
+          <button className="btn-back" onClick={onBack}>
+            Back
+          </button>
+          <h2>Settings</h2>
+        </div>
+        <div className="error-banner">{error}</div>
+      </div>
+    );
+  }
+
+  if (!draft) {
     return <div className="loading">Loading settings...</div>;
   }
 

@@ -389,15 +389,66 @@ fn encode_video(frames: &[CapturedFrame], fps: u32) -> (Vec<u8>, bool) {
 const THUMBNAIL_WIDTH: u32 = 320;
 const THUMBNAIL_JPEG_QUALITY: u8 = 80;
 
+/// Convert NV12 (Y + interleaved CbCr) to RGBA using BT.601 matrix.
+///
+/// Only used for thumbnail generation (once per clip save, not hot path).
+/// NV12 layout: Y plane (W*H bytes) then CbCr plane (W*H/2 bytes).
+fn nv12_to_rgba(nv12: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let w = width as usize;
+    let h = height as usize;
+    let y_size = w * h;
+    let expected_size = y_size + w * (h / 2);
+
+    if nv12.len() < expected_size {
+        warn!(
+            "NV12 data too small for {}x{}: expected {}, got {}",
+            width, height, expected_size, nv12.len()
+        );
+        return vec![0u8; w * h * 4];
+    }
+
+    let y_plane = &nv12[..y_size];
+    let uv_plane = &nv12[y_size..];
+
+    let mut rgba = Vec::with_capacity(w * h * 4);
+
+    for row in 0..h {
+        for col in 0..w {
+            let y = y_plane[row * w + col] as i32;
+            // CbCr plane: half resolution, interleaved pairs
+            let uv_row = row / 2;
+            let uv_col = (col / 2) * 2; // Cb at even index, Cr at odd
+            let uv_offset = uv_row * w + uv_col;
+            let cb = uv_plane[uv_offset] as i32;
+            let cr = uv_plane[uv_offset + 1] as i32;
+
+            // BT.601 video-range YCbCr → RGB
+            let c = y - 16;
+            let d = cb - 128;
+            let e = cr - 128;
+            let r = ((298 * c + 409 * e + 128) >> 8).clamp(0, 255) as u8;
+            let g = ((298 * c - 100 * d - 208 * e + 128) >> 8).clamp(0, 255) as u8;
+            let b = ((298 * c + 516 * d + 128) >> 8).clamp(0, 255) as u8;
+
+            rgba.push(r);
+            rgba.push(g);
+            rgba.push(b);
+            rgba.push(255);
+        }
+    }
+
+    rgba
+}
+
 /// Generate a JPEG thumbnail from a captured frame.
 ///
 /// Resizes the frame to `THUMBNAIL_WIDTH` pixels wide (maintaining aspect ratio)
-/// and encodes as JPEG. Handles both RGBA and BGRA pixel formats.
+/// and encodes as JPEG. Handles RGBA, BGRA, and NV12 pixel formats.
 fn generate_thumbnail(frame: &CapturedFrame) -> Vec<u8> {
     use image::{ImageBuffer, RgbaImage};
     use std::io::Cursor;
 
-    // Convert BGRA → RGBA for the image crate (one-time copy per clip save).
+    // Convert to RGBA for the image crate (one-time copy per clip save).
     let rgba_data = match frame.pixel_format {
         FramePixelFormat::Bgra => {
             let mut data = frame.data.clone();
@@ -407,6 +458,7 @@ fn generate_thumbnail(frame: &CapturedFrame) -> Vec<u8> {
             data
         }
         FramePixelFormat::Rgba => frame.data.clone(),
+        FramePixelFormat::Nv12 => nv12_to_rgba(&frame.data, frame.width, frame.height),
     };
 
     let img: Option<RgbaImage> =

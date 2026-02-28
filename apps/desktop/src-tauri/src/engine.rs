@@ -93,9 +93,14 @@ fn create_input_recorder(clock: SyncClock) -> Box<dyn InputRecorder> {
 }
 
 /// Returns the native pixel format for the current platform's capture backend.
-#[cfg(any(target_os = "windows", target_os = "macos"))]
+#[cfg(target_os = "windows")]
 fn platform_pixel_format() -> FramePixelFormat {
     FramePixelFormat::Bgra
+}
+
+#[cfg(target_os = "macos")]
+fn platform_pixel_format() -> FramePixelFormat {
+    FramePixelFormat::Nv12
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
@@ -217,8 +222,14 @@ pub fn start_capture(state: &EngineState) -> Result<(), Box<dyn std::error::Erro
         // 1/fps seconds apart. Without pacing, lower capture rates cause
         // the video to play faster than real-time (2x for half-rate).
         let frame_interval_us = 1_000_000u64 / settings.capture_fps as u64;
-        let mut last_captured_frame: Option<CapturedFrame> = None;
+        // Frame data is wrapped in Arc to share with the encoder channel
+        // via an 8-byte pointer bump instead of ~8MB data copy per push.
+        let mut last_frame_data: Option<Arc<Vec<u8>>> = None;
+        let mut last_frame_meta: Option<(u32, u32, u64, crate::capture::FramePixelFormat)> = None;
         let mut next_encoder_push_us: Option<u64> = None;
+        // Prevents re-cloning ~8MB every iteration for cache_first_raw_frame
+        // which internally guards with `if self.first_raw_frame.is_none()`.
+        let mut thumbnail_cached = false;
         // Burst cap: max frames pushed in one iteration to avoid overwhelming
         // the encoder after pauses. Allows recovery from ~200ms gaps.
         let max_burst = (settings.capture_fps / 5).max(2) as u64;
@@ -274,9 +285,13 @@ pub fn start_capture(state: &EngineState) -> Result<(), Box<dyn std::error::Erro
             // latest real frame (or duplicating the last-captured frame for
             // static content). Excess real frames are skipped, not pushed.
             if streaming_encoder.is_some() {
-                // Always keep the latest real frame as the push source
+                // Move the latest real frame into Arc-wrapped storage.
+                // `pop()` moves ownership (0 copies) instead of cloning ~8MB.
                 if !drained_frames.is_empty() {
-                    last_captured_frame = Some(drained_frames.last().unwrap().clone());
+                    let mut frame = drained_frames.pop().unwrap();
+                    last_frame_meta = Some((frame.width, frame.height, frame.timestamp_us, frame.pixel_format));
+                    // Move data into Arc — single allocation, shared via 8-byte pointer bumps
+                    last_frame_data = Some(Arc::new(std::mem::take(&mut frame.data)));
                 }
 
                 // Scoped borrow: use enc for push + poll, release before
@@ -293,7 +308,7 @@ pub fn start_capture(state: &EngineState) -> Result<(), Box<dyn std::error::Erro
                     let pacing = compute_pacing(
                         now_us,
                         next_encoder_push_us,
-                        last_captured_frame.is_some(),
+                        last_frame_data.is_some(),
                         max_burst,
                         frame_interval_us,
                     );
@@ -307,15 +322,17 @@ pub fn start_capture(state: &EngineState) -> Result<(), Box<dyn std::error::Erro
                     }
                     next_encoder_push_us = pacing.next_due_us;
 
-                    if let Some(ref frame) = last_captured_frame {
+                    if let Some(ref data_arc) = last_frame_data {
+                        let ts = last_frame_meta.map(|(_, _, ts, _)| ts).unwrap_or(0);
                         for _ in 0..pacing.pushes {
-                            if let Err(e) = enc.push_frame(frame) {
+                            // Arc::clone is ~8 bytes instead of ~8MB data copy
+                            if let Err(e) = enc.push_frame(Arc::clone(data_arc), ts) {
                                 warn!("Streaming encoder push failed: {e}");
                                 encoder_dead = true;
                                 break;
                             }
                             stats_push_count += 1;
-                            if drained_frames.is_empty() {
+                            if real_frame_count == 0 {
                                 stats_dup_count += 1;
                             }
                         }
@@ -364,24 +381,40 @@ pub fn start_capture(state: &EngineState) -> Result<(), Box<dyn std::error::Erro
                     }
                     encoder_ts_offset = None;
                     next_encoder_push_us = None;
+                    thumbnail_cached = false;
                     {
                         let mut s = lock_or_recover(&saver);
                         if let Some(ref mut buf) = s.encoded_chunks {
                             buf.clear();
                         }
-                        // Push current frame to raw buffer as fallback
-                        if let Some(frame) = last_captured_frame.take() {
-                            s.push_frame(frame);
+                        // Reconstruct frame from Arc data for raw buffer fallback
+                        if let (Some(data_arc), Some((w, h, ts, pf))) = (last_frame_data.take(), last_frame_meta.take()) {
+                            let data = Arc::try_unwrap(data_arc).unwrap_or_else(|arc| (*arc).clone());
+                            s.push_frame(CapturedFrame {
+                                timestamp_us: ts,
+                                width: w,
+                                height: h,
+                                data,
+                                pixel_format: pf,
+                            });
                         }
                     }
                 } else {
-                    // Cache thumbnail on new frames, push encoded chunks
-                    let needs_lock = real_frame_count > 0 || !pending_chunks.is_empty();
+                    // Cache thumbnail once, push encoded chunks
+                    let needs_lock = (real_frame_count > 0 && !thumbnail_cached) || !pending_chunks.is_empty();
                     if needs_lock {
                         let mut s = lock_or_recover(&saver);
-                        if real_frame_count > 0 {
-                            if let Some(ref frame) = last_captured_frame {
-                                s.cache_first_raw_frame(frame.clone());
+                        if real_frame_count > 0 && !thumbnail_cached {
+                            if let (Some(ref data_arc), Some((w, h, ts, pf))) = (&last_frame_data, &last_frame_meta) {
+                                // One-time ~8MB clone for thumbnail (not per-iteration)
+                                s.cache_first_raw_frame(CapturedFrame {
+                                    timestamp_us: *ts,
+                                    width: *w,
+                                    height: *h,
+                                    data: (**data_arc).clone(),
+                                    pixel_format: *pf,
+                                });
+                                thumbnail_cached = true;
                             }
                         }
                         for chunk in pending_chunks.drain(..) {
