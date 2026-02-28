@@ -19,6 +19,10 @@ pub enum FramePixelFormat {
     Rgba,
     /// Blue-Green-Red-Alpha (native macOS ScreenCaptureKit / Windows DXGI).
     Bgra,
+    /// NV12 two-plane YCbCr 4:2:0 (macOS ScreenCaptureKit native).
+    /// Layout: Y plane (W*H bytes) followed by interleaved CbCr plane (W*H/2 bytes).
+    /// Total size: W*H*3/2 bytes — 62% less than BGRA's W*H*4.
+    Nv12,
 }
 
 /// A single captured video frame with its timestamp and pixel data.
@@ -30,7 +34,9 @@ pub struct CapturedFrame {
     pub width: u32,
     /// Frame height in pixels.
     pub height: u32,
-    /// Raw pixel data (width * height * 4 bytes). Layout described by `pixel_format`.
+    /// Raw pixel data. Size depends on `pixel_format`:
+    /// - RGBA/BGRA: width * height * 4 bytes
+    /// - NV12: width * height * 3 / 2 bytes (Y plane + interleaved CbCr plane)
     pub data: Vec<u8>,
     /// Pixel format of `data`.
     pub pixel_format: FramePixelFormat,

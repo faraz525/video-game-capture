@@ -1,9 +1,10 @@
-use crate::capture::{CapturedFrame, FramePixelFormat};
+use crate::capture::FramePixelFormat;
 use crate::sync::encoded_ring_buffer::{ChunkType, EncodedChunk};
 use log::{debug, info, warn};
 use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -40,7 +41,10 @@ pub struct StreamingConfig {
 /// encoded chunks in real-time.
 pub trait StreamingEncoder: Send {
     fn start(&mut self, config: StreamingConfig) -> Result<(), StreamingEncoderError>;
-    fn push_frame(&mut self, frame: &CapturedFrame) -> Result<(), StreamingEncoderError>;
+    /// Push a frame to the encoder. `data` is the raw pixel bytes wrapped in
+    /// an `Arc` to avoid copying ~8MB per push. `timestamp_us` is the
+    /// SyncClock timestamp used to record the first frame's time.
+    fn push_frame(&mut self, data: Arc<Vec<u8>>, timestamp_us: u64) -> Result<(), StreamingEncoderError>;
     fn poll_chunk(&mut self) -> Result<Option<EncodedChunk>, StreamingEncoderError>;
     fn stop(&mut self) -> Result<(), StreamingEncoderError>;
     #[allow(dead_code)]
@@ -63,7 +67,9 @@ pub struct FfmpegStreamingEncoder {
     /// Dedicated writer thread that performs blocking stdin writes off the capture loop.
     writer_handle: Option<thread::JoinHandle<()>>,
     /// Bounded channel to send frame data to the writer thread without blocking.
-    frame_tx: Option<mpsc::SyncSender<Vec<u8>>>,
+    /// Uses `Arc<Vec<u8>>` so the capture loop can share frame data with an
+    /// 8-byte Arc clone instead of copying ~8MB per frame.
+    frame_tx: Option<mpsc::SyncSender<Arc<Vec<u8>>>>,
     frame_count: u64,
     dropped_frame_count: u64,
     /// SyncClock timestamp (us) of the first frame pushed. Used to offset
@@ -120,9 +126,12 @@ impl StreamingEncoder for FfmpegStreamingEncoder {
                         StreamingEncoderError::Process("stdin not available".into())
                     })?;
 
-                    const FRAME_CHANNEL_CAPACITY: usize = 8;
+                    // With Arc<Vec<u8>>, each slot costs ~8 bytes (pointer) instead
+                    // of ~8MB (full frame copy). 30 slots = 1s buffer at 30fps,
+                    // absorbing FFmpeg stdin stalls without dropping frames.
+                    const FRAME_CHANNEL_CAPACITY: usize = 30;
                     let (frame_tx, frame_rx) =
-                        mpsc::sync_channel::<Vec<u8>>(FRAME_CHANNEL_CAPACITY);
+                        mpsc::sync_channel::<Arc<Vec<u8>>>(FRAME_CHANNEL_CAPACITY);
 
                     let writer_handle = thread::spawn(move || {
                         let mut stdin = stdin;
@@ -158,7 +167,7 @@ impl StreamingEncoder for FfmpegStreamingEncoder {
         }))
     }
 
-    fn push_frame(&mut self, frame: &CapturedFrame) -> Result<(), StreamingEncoderError> {
+    fn push_frame(&mut self, data: Arc<Vec<u8>>, timestamp_us: u64) -> Result<(), StreamingEncoderError> {
         let tx = self
             .frame_tx
             .as_ref()
@@ -166,10 +175,11 @@ impl StreamingEncoder for FfmpegStreamingEncoder {
 
         // Record SyncClock timestamp of the very first frame
         if self.first_frame_timestamp_us.is_none() {
-            self.first_frame_timestamp_us = Some(frame.timestamp_us);
+            self.first_frame_timestamp_us = Some(timestamp_us);
         }
 
-        match tx.try_send(frame.data.clone()) {
+        // Arc clone is ~8 bytes instead of ~8MB frame data copy
+        match tx.try_send(data) {
             Ok(()) => {
                 self.frame_count += 1;
                 Ok(())
@@ -180,7 +190,6 @@ impl StreamingEncoder for FfmpegStreamingEncoder {
                     "Streaming encoder: frame {} dropped (backpressure, total dropped: {})",
                     self.frame_count, self.dropped_frame_count
                 );
-                self.frame_count += 1;
                 Ok(())
             }
             Err(mpsc::TrySendError::Disconnected(_)) => Err(
@@ -264,6 +273,27 @@ impl StreamingEncoder for FfmpegStreamingEncoder {
     }
 }
 
+/// Compute target bitrate for streaming encoding.
+///
+/// Uses a bits-per-pixel (BPP) factor of 0.3 which produces good quality
+/// for gaming content at reasonable file sizes:
+///   1080p/30fps → ~18.6 Mbps
+///   1080p/60fps → ~37.3 Mbps
+///   720p/30fps  → ~8.3 Mbps
+fn compute_bitrate(width: u32, height: u32, fps: u32) -> (String, String, String) {
+    let bpp = 0.3;
+    let bitrate = (width as u64 * height as u64 * fps as u64) as f64 * bpp;
+    let bitrate_kbps = (bitrate / 1000.0).round() as u64;
+    let maxrate_kbps = bitrate_kbps * 3 / 2; // 1.5x headroom for motion peaks
+    let bufsize_kbps = bitrate_kbps * 2; // 2x buffer for rate smoothing
+
+    (
+        format!("{bitrate_kbps}k"),
+        format!("{maxrate_kbps}k"),
+        format!("{bufsize_kbps}k"),
+    )
+}
+
 /// Build the codec priority list based on what's available.
 fn build_codec_list(ffmpeg_path: &str) -> Vec<(String, Vec<String>)> {
     let mut codecs = Vec::new();
@@ -271,12 +301,16 @@ fn build_codec_list(ffmpeg_path: &str) -> Vec<(String, Vec<String>)> {
     #[cfg(target_os = "macos")]
     {
         if is_codec_available(ffmpeg_path, "h264_videotoolbox") {
+            // Baseline profile = no B-frames → 1 GOP period less latency.
+            // prio_speed hint → VideoToolbox prioritizes encoding speed.
+            // Bitrate-based instead of quality-scale for predictable output.
             codecs.push((
                 "h264_videotoolbox".to_string(),
                 vec![
-                    "-q:v".to_string(), "65".to_string(),
                     "-allow_sw".to_string(), "1".to_string(),
                     "-realtime".to_string(), "1".to_string(),
+                    "-prio_speed".to_string(), "1".to_string(),
+                    "-profile:v".to_string(), "baseline".to_string(),
                 ],
             ));
         }
@@ -285,10 +319,14 @@ fn build_codec_list(ffmpeg_path: &str) -> Vec<(String, Vec<String>)> {
     #[cfg(target_os = "windows")]
     {
         if is_codec_available(ffmpeg_path, "h264_nvenc") {
+            // Low-latency tuning for real-time gaming capture.
+            // Baseline profile avoids B-frames for lower latency.
             codecs.push((
                 "h264_nvenc".to_string(),
                 vec![
                     "-preset".to_string(), "p4".to_string(),
+                    "-tune".to_string(), "ll".to_string(),
+                    "-profile:v".to_string(), "baseline".to_string(),
                     "-rc".to_string(), "vbr".to_string(),
                     "-cq".to_string(), "23".to_string(),
                 ],
@@ -331,6 +369,7 @@ fn start_ffmpeg_process(
     let input_pix_fmt = match config.pixel_format {
         FramePixelFormat::Bgra => "bgra",
         FramePixelFormat::Rgba => "rgba",
+        FramePixelFormat::Nv12 => "nv12",
     };
 
     let mut cmd = Command::new(ffmpeg_path);
@@ -346,6 +385,13 @@ fn start_ffmpeg_process(
 
     for arg in codec_args {
         cmd.arg(arg);
+    }
+
+    // Add bitrate control for hardware encoders (VT, NVENC).
+    // Software libx264 uses CRF which handles its own rate control.
+    if codec != "libx264" {
+        let (bitrate, maxrate, bufsize) = compute_bitrate(config.width, config.height, config.fps);
+        cmd.args(["-b:v", &bitrate, "-maxrate", &maxrate, "-bufsize", &bufsize]);
     }
 
     cmd.args([
@@ -600,15 +646,10 @@ mod tests {
 
         // Push enough frames and collect chunks inline
         let mut chunks = Vec::new();
-        for i in 0..90 {
-            let frame = CapturedFrame {
-                timestamp_us: i * 33_333,
-                width: 64,
-                height: 64,
-                data: vec![255, 0, 0, 255].repeat(64 * 64),
-                pixel_format: FramePixelFormat::Rgba,
-            };
-            if encoder.push_frame(&frame).is_err() {
+        for i in 0..90u64 {
+            let ts = i * 33_333;
+            let data = Arc::new(vec![255, 0, 0, 255].repeat(64 * 64));
+            if encoder.push_frame(data, ts).is_err() {
                 break;
             }
             while let Ok(Some(chunk)) = encoder.poll_chunk() {
@@ -649,15 +690,10 @@ mod tests {
 
         // Push frames until we get an init segment
         let mut got_init = false;
-        for i in 0..120 {
-            let frame = CapturedFrame {
-                timestamp_us: i * 33_333,
-                width: 64,
-                height: 64,
-                data: vec![255, 0, 0, 255].repeat(64 * 64),
-                pixel_format: FramePixelFormat::Rgba,
-            };
-            if encoder.push_frame(&frame).is_err() {
+        for i in 0..120u64 {
+            let ts = i * 33_333;
+            let data = Arc::new(vec![255, 0, 0, 255].repeat(64 * 64));
+            if encoder.push_frame(data, ts).is_err() {
                 break;
             }
 

@@ -51,7 +51,6 @@ impl SCStreamOutputTrait for FrameHandler {
 
         let src_width = pixel_buffer.width();
         let src_height = pixel_buffer.height();
-        let bytes_per_row = pixel_buffer.bytes_per_row();
 
         let guard = match pixel_buffer.lock_base_address(true) {
             Ok(g) => g,
@@ -60,14 +59,6 @@ impl SCStreamOutputTrait for FrameHandler {
                 return;
             }
         };
-
-        let base_ptr = guard.get_base_address();
-        if base_ptr.is_null() {
-            warn!("Pixel buffer base address is null");
-            return;
-        }
-        let total_bytes = bytes_per_row * src_height;
-        let slice = unsafe { std::slice::from_raw_parts(base_ptr, total_bytes) };
 
         let width = self.width;
         let height = self.height;
@@ -80,28 +71,115 @@ impl SCStreamOutputTrait for FrameHandler {
             return;
         }
 
-        // Copy pixel data, stripping any row padding from GPU alignment.
-        // ScreenCaptureKit delivers native BGRA — we keep it as-is to avoid
-        // per-frame swizzling on the capture hot path. Downstream consumers
-        // (FFmpeg, thumbnail) handle the pixel format via the tag.
-        let row_bytes = (width as usize) * 4;
-        let mut data = Vec::with_capacity(row_bytes * height as usize);
+        // Extract NV12 planes from ScreenCaptureKit's YCbCr_420v buffer.
+        // NV12 = Y plane (W*H) + interleaved CbCr plane (W*H/2).
+        // Total: 1.5 bytes/pixel vs BGRA's 4 bytes/pixel (62% savings).
+        let (data, pixel_format) = if pixel_buffer.is_planar() && pixel_buffer.get_plane_count() >= 2 {
+            let w = width as usize;
+            let h = height as usize;
+            let y_size = w * h;
+            let uv_size = w * (h / 2); // CbCr interleaved, half height, full width
 
-        for y in 0..height as usize {
-            let row_start = y * bytes_per_row;
-            let row_end = row_start + row_bytes;
-            if row_end > slice.len() {
-                break;
+            // Both plane pointers must be valid — skip frame if either is missing
+            let y_bpr = pixel_buffer.get_bytes_per_row_of_plane(0);
+            let y_height = pixel_buffer.get_height_of_plane(0);
+            let y_ptr = match pixel_buffer.get_base_address_of_plane(0) {
+                Some(ptr) => ptr,
+                None => {
+                    warn!("Y plane base address is null, skipping frame");
+                    return;
+                }
+            };
+
+            let uv_bpr = pixel_buffer.get_bytes_per_row_of_plane(1);
+            let uv_height = pixel_buffer.get_height_of_plane(1);
+            let uv_ptr = match pixel_buffer.get_base_address_of_plane(1) {
+                Some(ptr) => ptr,
+                None => {
+                    warn!("CbCr plane base address is null, skipping frame");
+                    return;
+                }
+            };
+
+            // Validate plane sizes before reading
+            let y_total = y_bpr * y_height;
+            let uv_total = uv_bpr * uv_height;
+            if y_total < y_bpr * h.min(y_height) {
+                warn!("Y plane buffer too small: {} < expected {}", y_total, y_bpr * h);
+                return;
             }
-            data.extend_from_slice(&slice[row_start..row_end]);
-        }
+            if uv_total < uv_bpr * (h / 2).min(uv_height) {
+                warn!("CbCr plane buffer too small: {} < expected {}", uv_total, uv_bpr * (h / 2));
+                return;
+            }
+
+            let mut nv12_data = Vec::with_capacity(y_size + uv_size);
+
+            // Y plane (plane 0): luma, full resolution
+            let y_slice = unsafe { std::slice::from_raw_parts(y_ptr, y_total) };
+            for y in 0..h.min(y_height) {
+                let row_start = y * y_bpr;
+                let row_end = row_start + w;
+                if row_end > y_slice.len() {
+                    warn!("Y plane row {} out of bounds, truncating frame", y);
+                    break;
+                }
+                nv12_data.extend_from_slice(&y_slice[row_start..row_end]);
+            }
+
+            // CbCr plane (plane 1): chroma interleaved, half resolution
+            let uv_slice = unsafe { std::slice::from_raw_parts(uv_ptr, uv_total) };
+            let uv_row_bytes = w; // CbCr pairs: (w/2) pairs * 2 bytes = w bytes
+            for y in 0..(h / 2).min(uv_height) {
+                let row_start = y * uv_bpr;
+                let row_end = row_start + uv_row_bytes;
+                if row_end > uv_slice.len() {
+                    warn!("CbCr plane row {} out of bounds, truncating frame", y);
+                    break;
+                }
+                nv12_data.extend_from_slice(&uv_slice[row_start..row_end]);
+            }
+
+            // Verify we got the expected amount of data
+            if nv12_data.len() < y_size + uv_size {
+                warn!(
+                    "NV12 frame incomplete: got {} bytes, expected {}",
+                    nv12_data.len(), y_size + uv_size
+                );
+                return;
+            }
+
+            (nv12_data, FramePixelFormat::Nv12)
+        } else {
+            // Fallback: non-planar buffer (shouldn't happen with YCbCr_420v,
+            // but handle gracefully). Extract as BGRA.
+            let bytes_per_row = pixel_buffer.bytes_per_row();
+            let base_ptr = guard.get_base_address();
+            if base_ptr.is_null() {
+                warn!("Pixel buffer base address is null");
+                return;
+            }
+            let total_bytes = bytes_per_row * src_height;
+            let slice = unsafe { std::slice::from_raw_parts(base_ptr, total_bytes) };
+            let row_bytes = (width as usize) * 4;
+            let mut bgra_data = Vec::with_capacity(row_bytes * height as usize);
+            for y in 0..height as usize {
+                let row_start = y * bytes_per_row;
+                let row_end = row_start + row_bytes;
+                if row_end > slice.len() {
+                    break;
+                }
+                bgra_data.extend_from_slice(&slice[row_start..row_end]);
+            }
+            (bgra_data, FramePixelFormat::Bgra)
+        };
 
         let frame = CapturedFrame {
             timestamp_us: self.clock.now_us(),
             width,
             height,
             data,
-            pixel_format: FramePixelFormat::Bgra,
+            pixel_format,
         };
 
         if let Ok(mut buf) = self.buffer.lock() {
@@ -176,11 +254,18 @@ impl ScreenCapture for MacOSCapture {
         // call is silently ignored. SCK therefore delivers at the display refresh
         // rate (~60fps). The engine's rate-limited push loop in engine.rs handles
         // this by only pushing frames at target_fps to the encoder.
+        //
+        // queue_depth controls SCK's internal frame buffer. Higher values give
+        // more headroom before SCK drops frames during momentary stalls.
+        // Formula: scale with fps, clamped to [3, 8]. At 30fps → 5.
+        // (queue_depth uses isize FFI, no ABI mismatch like minimum_frame_interval)
+        let queue_depth = ((config.target_fps as i32 / 30) * 5).clamp(3, 8);
         let stream_config = SCStreamConfiguration::builder()
             .width(width)
             .height(height)
-            .pixel_format(PixelFormat::BGRA)
+            .pixel_format(PixelFormat::YCbCr_420v)
             .shows_cursor(true)
+            .queue_depth(queue_depth)
             .build();
 
         let handler = FrameHandler {

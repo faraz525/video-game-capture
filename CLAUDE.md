@@ -37,12 +37,12 @@ Tauri v2 monorepo: Rust backend captures screen/input/audio, React+TypeScript fr
 **Data flow:** Capture sources → `Arc<Mutex<ClipSaver>>` (capture thread pushes directly) → `RingBuffer<T: Timestamped>` (last N seconds) → `save_clip()` drains buffers → `write_clip()` produces `.gameclip` zip archive.
 
 **Key modules:**
-- `engine.rs` — `EngineState` (managed Tauri state): owns `Arc<Mutex<ClipSaver>>`, `AppSettings`, spawns capture thread. Uses cfg-gated factory functions to select platform implementations. Integrates game detection via `detect_current_game()`.
-- `clip/encoder.rs` — `FfmpegEncoder` subprocess: pipes raw BGRA frames via stdin to FFmpeg. Tries NVENC (`h264_nvenc`) first, falls back to `libx264`. `reencode_raw_to_mp4()` re-encodes raw RGBA clips on playback. FFmpeg path resolution: (1) `GAMECLIP_FFMPEG_PATH` env, (2) bundled sidecar, (3) exe-adjacent, (4) well-known paths, (5) system PATH.
-- `clip/streaming.rs` — `StreamingEncoder` trait + `FfmpegStreamingEncoder`: pipes frames to FFmpeg during capture for real-time encoding. Produces fragmented MP4 chunks stored in `EncodedRingBuffer`. Falls back to raw RGBA when FFmpeg unavailable.
+- `engine.rs` — `EngineState` (managed Tauri state): owns `Arc<Mutex<ClipSaver>>`, `AppSettings`, `upload_cancel: Arc<AtomicBool>`, spawns capture thread. Uses cfg-gated factory functions to select platform implementations. Integrates game detection via `detect_current_game()`. Capture loop uses FIFO drain (all available frames per iteration), two-phase frame pacing with `max_burst` cap, and a dedicated writer thread for FFmpeg stdin to avoid blocking.
+- `clip/encoder.rs` — `FfmpegEncoder` subprocess: pipes raw BGRA frames via stdin to FFmpeg. Platform-aware codec priority: macOS uses `h264_videotoolbox` → `libx264`, Windows uses `h264_nvenc` → `libx264`. `reencode_raw_to_mp4()` re-encodes raw RGBA clips on playback. FFmpeg path resolution: (1) `GAMECLIP_FFMPEG_PATH` env, (2) bundled sidecar, (3) exe-adjacent, (4) well-known paths, (5) system PATH.
+- `clip/streaming.rs` — `StreamingEncoder` trait + `FfmpegStreamingEncoder`: pipes frames to FFmpeg during capture for real-time encoding. Produces fragmented MP4 chunks stored in `EncodedRingBuffer`. Falls back to raw RGBA when FFmpeg unavailable. `GOP_MULTIPLIER = 2` (keyframe every 2 seconds).
 - `game/detector.rs` — Game detection: foreground window check (Windows-only) + process scan (cross-platform via `sysinfo`). Matches against ~30 known game process names. Also provides `game_to_genre()` mapping used by quality scoring.
 - `commands.rs` — Tauri IPC commands: `list_clips`, `get_clip_metadata`, `delete_clip`, `save_clip`, `get_settings`, `update_settings`, `extract_clip_video`, `get_clip_thumbnail`, `get_clip_input_events`, `annotate_clip`, `get_frame_actions`, `get_quality_score`, `export_clips`, `upload_clips`, `cancel_upload`
-- `lib.rs` — App entry: registers state, system tray, global shortcut (`Ctrl+Shift+R`), IPC handlers. On hotkey: saves clip and emits `"clip-saved"` event to webview.
+- `lib.rs` — App entry: registers state (`EngineState`), plugins (`opener`, `shell`, `global-shortcut`), system tray ("Settings"/"Quit"), global shortcut (`Ctrl+Shift+R`), IPC handlers (15 commands). Logging via `simplelog` to `~/GameClip/gameclip.log` + terminal. On hotkey: saves clip and emits `"clip-saved"` event to webview.
 - `sync/ring_buffer.rs` — Generic `RingBuffer<T>` backed by `VecDeque`, evicts by `max_duration_us`
 - `sync/encoded_ring_buffer.rs` — `EncodedRingBuffer` for storing encoded video chunks from streaming encoder. Time-based eviction, `drain_as_fmp4()` concatenation, first-frame thumbnail cache.
 - `sync/clock.rs` — `SyncClock` wraps `Arc<Instant>`, derives `Clone` so all clones share the same epoch for cross-stream timestamp synchronization
@@ -74,7 +74,7 @@ Simple page router in `App.tsx` using `useState<"library" | "player" | "settings
 - `useSettings` — calls `invoke()` for settings get/update (includes `HuggingFaceConfig`)
 - `useUpload` — listens to `upload-progress` Tauri events, exposes `uploadClips()`, `cancelUpload()`, progress state
 
-**Pages:** `ClipLibrary` (grid of ClipCards), `ClipPlayer` (rAF-based playback with InputOverlay), `Settings` (form with draft state pattern).
+**Pages:** `ClipLibrary` (grid of ClipCards), `ClipPlayer` (rAF-based playback with InputOverlay), `Settings` (form with draft state pattern — capture settings, storage, and HuggingFace upload config with consent/quality gate/private repo toggles).
 
 **`InputOverlay`** — Renders active keys, mouse cursor, and click ripples synced to playback time using 500ms visibility windows.
 
@@ -96,10 +96,10 @@ Zip archive containing:
 
 ## Testing
 
-173 Rust unit tests, all co-located with source (`#[cfg(test)] mod tests`). 3 frontend tests (Vitest + @testing-library/react) in `src/hooks/useUpload.test.ts`.
+183 Rust unit tests, all co-located with source (`#[cfg(test)] mod tests`). 3 frontend tests (Vitest + @testing-library/react) in `src/hooks/useUpload.test.ts`.
 
 Rust tests use `tempfile::TempDir` for filesystem operations and `std::thread::sleep` for timing. Pattern: test state machine transitions (start/stop), error conditions (double-start, poll-without-start), data integrity, serialization round-trips, annotation pipeline correctness, upload privacy scrubbing, and HTTP mocking via `mockito`. Frontend tests mock `@tauri-apps/api/core` and `@tauri-apps/api/event` (configured in `src/test-setup.ts`).
 
 ## Implementation Status
 
-Steps 1-5 complete (scaffolding, platform abstraction, ring buffer + clip save, clip library UI, Windows capture engine) plus data annotation pipeline, streaming encoding (Phase 1), FFmpeg sidecar bundling (Phase 2), format versioning with checksums (Phase 3), and HuggingFace upload pipeline (Phase 4). See `PLAN.md` for full roadmap.
+Steps 1–10 complete: scaffolding, platform abstraction, ring buffer + clip save, clip library UI, data annotation pipeline, Windows capture engine (untested on hardware), streaming encoding, FFmpeg sidecar bundling, format versioning with SHA-256 checksums, and HuggingFace upload pipeline. Recent work on `feat/production-readiness` branch added 1080p capture, clock-based frame pacing, FIFO drain loop, non-blocking encoder writes, and fast clip library loading with targeted zip reads and thumbnail caching. See `PLAN.md` for full roadmap.

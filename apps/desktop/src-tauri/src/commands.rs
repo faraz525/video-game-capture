@@ -47,7 +47,12 @@ pub fn list_clips(state: State<'_, EngineState>) -> Result<Vec<ClipSummary>, Str
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("gameclip") {
+        // Skip temp files from in-progress writes (atomic rename pattern)
+        let is_temp = path.file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.starts_with(".tmp_"))
+            .unwrap_or(false);
+        if !is_temp && path.extension().and_then(|e| e.to_str()) == Some("gameclip") {
             match read_clip_metadata(&path) {
                 Ok(meta) => {
                     clips.push(ClipSummary {

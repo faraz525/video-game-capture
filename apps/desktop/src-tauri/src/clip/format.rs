@@ -163,46 +163,67 @@ pub fn write_clip_with_options(
         ..data.metadata.clone()
     };
 
-    // Now write the zip
-    let file = File::create(path)?;
-    let mut zip = ZipWriter::new(file);
-    let zip_options = FileOptions::<()>::default()
-        .compression_method(zip::CompressionMethod::Deflated);
+    // Write to a temporary file in the same directory, then atomically rename.
+    // This prevents list_clips from seeing a partial zip (missing EOCD)
+    // when a concurrent save triggers a UI refresh mid-write.
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let temp_path = parent.join(format!(
+        ".tmp_{}_{}.gameclip",
+        std::process::id(),
+        uuid::Uuid::new_v4().as_simple()
+    ));
 
-    // Write all data entries first
-    zip.start_file("input.jsonl", zip_options)?;
-    zip.write_all(&input_bytes)?;
+    let result = (|| -> Result<(), ClipFormatError> {
+        let file = File::create(&temp_path)?;
+        let mut zip = ZipWriter::new(file);
+        let zip_options = FileOptions::<()>::default()
+            .compression_method(zip::CompressionMethod::Deflated);
 
-    zip.start_file("video.bin", zip_options)?;
-    zip.write_all(&data.video_data)?;
+        // Write all data entries first
+        zip.start_file("input.jsonl", zip_options)?;
+        zip.write_all(&input_bytes)?;
 
-    if !data.audio_data.is_empty() {
-        zip.start_file("audio.bin", zip_options)?;
-        zip.write_all(&data.audio_data)?;
+        zip.start_file("video.bin", zip_options)?;
+        zip.write_all(&data.video_data)?;
+
+        if !data.audio_data.is_empty() {
+            zip.start_file("audio.bin", zip_options)?;
+            zip.write_all(&data.audio_data)?;
+        }
+
+        if !data.thumbnail.is_empty() {
+            zip.start_file("thumbnail.jpg", zip_options)?;
+            zip.write_all(&data.thumbnail)?;
+        }
+
+        if let Some(ref bytes) = frame_actions_bytes {
+            zip.start_file("frame_actions.jsonl", zip_options)?;
+            zip.write_all(bytes)?;
+        }
+
+        if let Some(ref bytes) = quality_bytes {
+            zip.start_file("quality.json", zip_options)?;
+            zip.write_all(bytes)?;
+        }
+
+        // Write metadata.json LAST (with checksums populated)
+        zip.start_file("metadata.json", zip_options)?;
+        let metadata_json = serde_json::to_string_pretty(&metadata)?;
+        zip.write_all(metadata_json.as_bytes())?;
+
+        zip.finish()?;
+
+        // Atomic rename: list_clips only ever sees a complete .gameclip file
+        std::fs::rename(&temp_path, path)?;
+        Ok(())
+    })();
+
+    // Clean up temp file on any failure to avoid orphaned files
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
     }
 
-    if !data.thumbnail.is_empty() {
-        zip.start_file("thumbnail.jpg", zip_options)?;
-        zip.write_all(&data.thumbnail)?;
-    }
-
-    if let Some(ref bytes) = frame_actions_bytes {
-        zip.start_file("frame_actions.jsonl", zip_options)?;
-        zip.write_all(bytes)?;
-    }
-
-    if let Some(ref bytes) = quality_bytes {
-        zip.start_file("quality.json", zip_options)?;
-        zip.write_all(bytes)?;
-    }
-
-    // Write metadata.json LAST (with checksums populated)
-    zip.start_file("metadata.json", zip_options)?;
-    let metadata_json = serde_json::to_string_pretty(&metadata)?;
-    zip.write_all(metadata_json.as_bytes())?;
-
-    zip.finish()?;
-    Ok(())
+    result
 }
 
 /// Contents read back from a .gameclip file.

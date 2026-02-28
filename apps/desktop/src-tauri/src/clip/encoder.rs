@@ -41,12 +41,13 @@ impl FfmpegEncoder {
         let ffmpeg_path = find_ffmpeg()?;
         info!("FFmpeg found at: {ffmpeg_path}");
 
-        // Codec priority order based on platform
+        // Codec priority order based on platform.
+        // Hardware encoders use baseline profile (no B-frames) for lower latency.
         let codecs: &[(&str, &[&str])] = &[
             #[cfg(target_os = "macos")]
-            ("h264_videotoolbox", &["-q:v", "65", "-allow_sw", "1"]),
+            ("h264_videotoolbox", &["-allow_sw", "1", "-prio_speed", "1", "-profile:v", "baseline"]),
             #[cfg(target_os = "windows")]
-            ("h264_nvenc", &["-preset", "p4", "-rc", "vbr", "-cq", "23"]),
+            ("h264_nvenc", &["-preset", "p4", "-tune", "ll", "-profile:v", "baseline", "-rc", "vbr", "-cq", "23"]),
             ("libx264", &["-preset", "ultrafast", "-crf", "23"]),
         ];
 
@@ -94,6 +95,7 @@ impl FfmpegEncoder {
         let input_pix_fmt = match pixel_format {
             FramePixelFormat::Bgra => "bgra",
             FramePixelFormat::Rgba => "rgba",
+            FramePixelFormat::Nv12 => "nv12",
         };
         let mut cmd = Command::new(ffmpeg_path);
         cmd.args([
