@@ -395,7 +395,8 @@ const THUMBNAIL_JPEG_QUALITY: u8 = 80;
 /// NV12 layout: Y plane (W*H bytes) then CbCr plane (W*H/2 bytes).
 fn nv12_to_rgba(nv12: &[u8], width: u32, height: u32) -> Vec<u8> {
     let w = width as usize;
-    let h = height as usize;
+    // NV12 requires even dimensions — round down to avoid OOB on CbCr plane
+    let h = (height as usize) & !1;
     let y_size = w * h;
     let expected_size = y_size + w * (h / 2);
 

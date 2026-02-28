@@ -79,38 +79,74 @@ impl SCStreamOutputTrait for FrameHandler {
             let h = height as usize;
             let y_size = w * h;
             let uv_size = w * (h / 2); // CbCr interleaved, half height, full width
+
+            // Both plane pointers must be valid — skip frame if either is missing
+            let y_bpr = pixel_buffer.get_bytes_per_row_of_plane(0);
+            let y_height = pixel_buffer.get_height_of_plane(0);
+            let y_ptr = match pixel_buffer.get_base_address_of_plane(0) {
+                Some(ptr) => ptr,
+                None => {
+                    warn!("Y plane base address is null, skipping frame");
+                    return;
+                }
+            };
+
+            let uv_bpr = pixel_buffer.get_bytes_per_row_of_plane(1);
+            let uv_height = pixel_buffer.get_height_of_plane(1);
+            let uv_ptr = match pixel_buffer.get_base_address_of_plane(1) {
+                Some(ptr) => ptr,
+                None => {
+                    warn!("CbCr plane base address is null, skipping frame");
+                    return;
+                }
+            };
+
+            // Validate plane sizes before reading
+            let y_total = y_bpr * y_height;
+            let uv_total = uv_bpr * uv_height;
+            if y_total < y_bpr * h.min(y_height) {
+                warn!("Y plane buffer too small: {} < expected {}", y_total, y_bpr * h);
+                return;
+            }
+            if uv_total < uv_bpr * (h / 2).min(uv_height) {
+                warn!("CbCr plane buffer too small: {} < expected {}", uv_total, uv_bpr * (h / 2));
+                return;
+            }
+
             let mut nv12_data = Vec::with_capacity(y_size + uv_size);
 
             // Y plane (plane 0): luma, full resolution
-            let y_bpr = pixel_buffer.get_bytes_per_row_of_plane(0);
-            let y_height = pixel_buffer.get_height_of_plane(0);
-            if let Some(y_ptr) = pixel_buffer.get_base_address_of_plane(0) {
-                let y_total = y_bpr * y_height;
-                let y_slice = unsafe { std::slice::from_raw_parts(y_ptr, y_total) };
-                // Strip padding per row (GPU may pad rows for alignment)
-                for y in 0..h.min(y_height) {
-                    let row_start = y * y_bpr;
-                    let row_end = row_start + w;
-                    if row_end <= y_slice.len() {
-                        nv12_data.extend_from_slice(&y_slice[row_start..row_end]);
-                    }
+            let y_slice = unsafe { std::slice::from_raw_parts(y_ptr, y_total) };
+            for y in 0..h.min(y_height) {
+                let row_start = y * y_bpr;
+                let row_end = row_start + w;
+                if row_end > y_slice.len() {
+                    warn!("Y plane row {} out of bounds, truncating frame", y);
+                    break;
                 }
+                nv12_data.extend_from_slice(&y_slice[row_start..row_end]);
             }
 
             // CbCr plane (plane 1): chroma interleaved, half resolution
-            let uv_bpr = pixel_buffer.get_bytes_per_row_of_plane(1);
-            let uv_height = pixel_buffer.get_height_of_plane(1);
-            if let Some(uv_ptr) = pixel_buffer.get_base_address_of_plane(1) {
-                let uv_total = uv_bpr * uv_height;
-                let uv_slice = unsafe { std::slice::from_raw_parts(uv_ptr, uv_total) };
-                let uv_row_bytes = w; // CbCr pairs: (w/2) pairs * 2 bytes = w bytes
-                for y in 0..(h / 2).min(uv_height) {
-                    let row_start = y * uv_bpr;
-                    let row_end = row_start + uv_row_bytes;
-                    if row_end <= uv_slice.len() {
-                        nv12_data.extend_from_slice(&uv_slice[row_start..row_end]);
-                    }
+            let uv_slice = unsafe { std::slice::from_raw_parts(uv_ptr, uv_total) };
+            let uv_row_bytes = w; // CbCr pairs: (w/2) pairs * 2 bytes = w bytes
+            for y in 0..(h / 2).min(uv_height) {
+                let row_start = y * uv_bpr;
+                let row_end = row_start + uv_row_bytes;
+                if row_end > uv_slice.len() {
+                    warn!("CbCr plane row {} out of bounds, truncating frame", y);
+                    break;
                 }
+                nv12_data.extend_from_slice(&uv_slice[row_start..row_end]);
+            }
+
+            // Verify we got the expected amount of data
+            if nv12_data.len() < y_size + uv_size {
+                warn!(
+                    "NV12 frame incomplete: got {} bytes, expected {}",
+                    nv12_data.len(), y_size + uv_size
+                );
+                return;
             }
 
             (nv12_data, FramePixelFormat::Nv12)
