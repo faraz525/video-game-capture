@@ -93,18 +93,30 @@ fn create_input_recorder(clock: SyncClock) -> Box<dyn InputRecorder> {
 }
 
 /// Returns the native pixel format for the current platform's capture backend.
+///
+/// Prefers NV12 when available (macOS always, Windows when D3D11 VideoProcessor
+/// succeeds). Falls back to BGRA/RGBA otherwise.
+fn capture_pixel_format(screen: &dyn ScreenCapture) -> FramePixelFormat {
+    if screen.nv12_active() {
+        FramePixelFormat::Nv12
+    } else {
+        platform_default_pixel_format()
+    }
+}
+
+/// Compile-time default pixel format (used before runtime detection is available).
 #[cfg(target_os = "windows")]
-fn platform_pixel_format() -> FramePixelFormat {
+fn platform_default_pixel_format() -> FramePixelFormat {
     FramePixelFormat::Bgra
 }
 
 #[cfg(target_os = "macos")]
-fn platform_pixel_format() -> FramePixelFormat {
+fn platform_default_pixel_format() -> FramePixelFormat {
     FramePixelFormat::Nv12
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-fn platform_pixel_format() -> FramePixelFormat {
+fn platform_default_pixel_format() -> FramePixelFormat {
     FramePixelFormat::Rgba
 }
 
@@ -158,6 +170,8 @@ pub fn start_capture(state: &EngineState) -> Result<(), Box<dyn std::error::Erro
             target_fps: settings.capture_fps,
             width: settings.capture_width,
             height: settings.capture_height,
+            adapter_index: 0,
+            display_index: 0,
         };
         let audio_config = AudioConfig::default();
 
@@ -180,33 +194,66 @@ pub fn start_capture(state: &EngineState) -> Result<(), Box<dyn std::error::Erro
             return;
         }
 
-        // Try to start streaming encoder for in-capture encoding
+        // Try to start streaming encoder for in-capture encoding.
+        // On Windows with NV12 active, try MediaFoundation GPU encoder first
+        // (zero-copy), falling back to FFmpeg.
+        let active_pixel_format = capture_pixel_format(screen.as_ref());
         let mut streaming_encoder: Option<Box<dyn StreamingEncoder>> = None;
+        let mut force_software_codec = false;
         {
-            let mut enc = FfmpegStreamingEncoder::new();
             let streaming_config = StreamingConfig {
                 width: settings.capture_width,
                 height: settings.capture_height,
                 fps: settings.capture_fps,
-                pixel_format: platform_pixel_format(),
+                pixel_format: active_pixel_format,
             };
-            match enc.start(streaming_config) {
-                Ok(()) => {
-                    info!("Streaming encoder active — frames will be encoded in real-time");
-                    let gop_frames = settings.capture_fps * crate::clip::streaming::GOP_MULTIPLIER;
-                    let fragment_duration_us =
-                        (gop_frames as u64 * 1_000_000) / settings.capture_fps as u64;
-                    // Enable encoded buffer in saver
-                    let mut s = lock_or_recover(&saver);
-                    s.enable_encoded_buffer(
-                        settings.buffer_duration_secs,
-                        fragment_duration_us,
-                        settings.capture_fps,
-                    );
-                    streaming_encoder = Some(Box::new(enc));
+
+            // Phase 4: Try MediaFoundation zero-copy GPU encoder on Windows
+            #[cfg(target_os = "windows")]
+            if active_pixel_format == FramePixelFormat::Nv12 {
+                let mut mf_enc = crate::clip::mf_encoder::MfStreamingEncoder::new();
+                match mf_enc.start(streaming_config.clone()) {
+                    Ok(()) => {
+                        info!("MediaFoundation GPU encoder active — zero-copy encoding");
+                        let gop_frames =
+                            settings.capture_fps * crate::clip::streaming::GOP_MULTIPLIER;
+                        let fragment_duration_us =
+                            (gop_frames as u64 * 1_000_000) / settings.capture_fps as u64;
+                        let mut s = lock_or_recover(&saver);
+                        s.enable_encoded_buffer(
+                            settings.buffer_duration_secs,
+                            fragment_duration_us,
+                            settings.capture_fps,
+                        );
+                        streaming_encoder = Some(Box::new(mf_enc));
+                    }
+                    Err(e) => {
+                        warn!("MediaFoundation encoder unavailable, trying FFmpeg: {e}");
+                    }
                 }
-                Err(e) => {
-                    warn!("Streaming encoder unavailable, falling back to raw buffer: {e}");
+            }
+
+            // Fallback: FFmpeg-based encoder (all platforms)
+            if streaming_encoder.is_none() {
+                let mut enc = FfmpegStreamingEncoder::new();
+                match enc.start(streaming_config) {
+                    Ok(()) => {
+                        info!("Streaming encoder active — frames will be encoded in real-time");
+                        let gop_frames =
+                            settings.capture_fps * crate::clip::streaming::GOP_MULTIPLIER;
+                        let fragment_duration_us =
+                            (gop_frames as u64 * 1_000_000) / settings.capture_fps as u64;
+                        let mut s = lock_or_recover(&saver);
+                        s.enable_encoded_buffer(
+                            settings.buffer_duration_secs,
+                            fragment_duration_us,
+                            settings.capture_fps,
+                        );
+                        streaming_encoder = Some(Box::new(enc));
+                    }
+                    Err(e) => {
+                        warn!("Streaming encoder unavailable, falling back to raw buffer: {e}");
+                    }
                 }
             }
         }
@@ -234,13 +281,14 @@ pub fn start_capture(state: &EngineState) -> Result<(), Box<dyn std::error::Erro
         // the encoder after pauses. Allows recovery from ~200ms gaps.
         let max_burst = (settings.capture_fps / 5).max(2) as u64;
 
-        // Capture diagnostics: logged every 10 seconds
+        // Capture diagnostics: logged every 5 seconds
         let mut stats_capture_count: u64 = 0;
         let mut stats_push_count: u64 = 0;
         let mut stats_dup_count: u64 = 0;
         let mut stats_skip_count: u64 = 0;
+        let mut stats_drop_count: u64 = 0;
         let mut last_stats_us: u64 = 0;
-        const STATS_INTERVAL_US: u64 = 10_000_000;
+        const STATS_INTERVAL_US: u64 = 5_000_000;
 
         // Session-level totals for shutdown summary
         let mut session_push_total: u64 = 0;
@@ -372,8 +420,8 @@ pub fn start_capture(state: &EngineState) -> Result<(), Box<dyn std::error::Erro
                 // enc borrow released here
 
                 if encoder_dead {
-                    // Encoder died: clean up and clear stale data
-                    warn!("Streaming encoder died, falling back to raw frame buffer");
+                    // Encoder died: clean up and attempt restart with software codecs.
+                    // If already on software codecs, fall back to raw frame buffer.
                     if let Some(mut dead_enc) = streaming_encoder.take() {
                         if let Err(e) = dead_enc.stop() {
                             warn!("Error stopping dead encoder: {e}");
@@ -387,9 +435,65 @@ pub fn start_capture(state: &EngineState) -> Result<(), Box<dyn std::error::Erro
                         if let Some(ref mut buf) = s.encoded_chunks {
                             buf.clear();
                         }
-                        // Reconstruct frame from Arc data for raw buffer fallback
-                        if let (Some(data_arc), Some((w, h, ts, pf))) = (last_frame_data.take(), last_frame_meta.take()) {
-                            let data = Arc::try_unwrap(data_arc).unwrap_or_else(|arc| (*arc).clone());
+                    }
+
+                    if !force_software_codec {
+                        // First failure: restart with software-only codecs
+                        warn!("Encoder stalled/died, restarting with software-only codecs");
+                        force_software_codec = true;
+                        let mut enc = FfmpegStreamingEncoder::new();
+                        enc.set_force_software(true);
+                        let streaming_config = StreamingConfig {
+                            width: settings.capture_width,
+                            height: settings.capture_height,
+                            fps: settings.capture_fps,
+                            pixel_format: active_pixel_format,
+                        };
+                        match enc.start(streaming_config) {
+                            Ok(()) => {
+                                info!("Streaming encoder restarted with software codec");
+                                let gop_frames = settings.capture_fps
+                                    * crate::clip::streaming::GOP_MULTIPLIER;
+                                let fragment_duration_us = (gop_frames as u64 * 1_000_000)
+                                    / settings.capture_fps as u64;
+                                let mut s = lock_or_recover(&saver);
+                                s.enable_encoded_buffer(
+                                    settings.buffer_duration_secs,
+                                    fragment_duration_us,
+                                    settings.capture_fps,
+                                );
+                                streaming_encoder = Some(Box::new(enc));
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Software encoder restart failed, falling back to raw: {e}"
+                                );
+                                // Reconstruct frame for raw buffer fallback
+                                if let (Some(data_arc), Some((w, h, ts, pf))) =
+                                    (last_frame_data.take(), last_frame_meta.take())
+                                {
+                                    let data = Arc::try_unwrap(data_arc)
+                                        .unwrap_or_else(|arc| (*arc).clone());
+                                    let mut s = lock_or_recover(&saver);
+                                    s.push_frame(CapturedFrame {
+                                        timestamp_us: ts,
+                                        width: w,
+                                        height: h,
+                                        data,
+                                        pixel_format: pf,
+                                    });
+                                }
+                            }
+                        }
+                    } else {
+                        // Already on software codecs — fall back to raw buffer
+                        warn!("Software encoder also died, falling back to raw frame buffer");
+                        if let (Some(data_arc), Some((w, h, ts, pf))) =
+                            (last_frame_data.take(), last_frame_meta.take())
+                        {
+                            let data = Arc::try_unwrap(data_arc)
+                                .unwrap_or_else(|arc| (*arc).clone());
+                            let mut s = lock_or_recover(&saver);
                             s.push_frame(CapturedFrame {
                                 timestamp_us: ts,
                                 width: w,
@@ -448,7 +552,12 @@ pub fn start_capture(state: &EngineState) -> Result<(), Box<dyn std::error::Erro
                 s.push_audio(buffer);
             }
 
-            // Periodic capture rate diagnostics
+            // Track encoder drops for this interval
+            if let Some(ref enc) = streaming_encoder {
+                stats_drop_count = enc.dropped_frame_count();
+            }
+
+            // Periodic capture rate diagnostics (every 5 seconds)
             if now_us.saturating_sub(last_stats_us) >= STATS_INTERVAL_US && last_stats_us > 0 {
                 let elapsed = (now_us - last_stats_us) as f64 / 1_000_000.0;
                 let expected_frames = elapsed * settings.capture_fps as f64;
@@ -457,21 +566,30 @@ pub fn start_capture(state: &EngineState) -> Result<(), Box<dyn std::error::Erro
                 } else {
                     0.0
                 };
+                let capture_fps = stats_capture_count as f64 / elapsed;
+                let push_fps = stats_push_count as f64 / elapsed;
+                let drop_rate = if stats_push_count > 0 {
+                    stats_drop_count as f64 / (stats_push_count + stats_drop_count) as f64
+                } else {
+                    0.0
+                };
                 info!(
-                    "Capture stats: capture={:.1}fps, encoder_push={:.1}fps (target={}fps), \
-                     skipped={}, duplicated={}, pacing_ratio={:.3}",
-                    stats_capture_count as f64 / elapsed,
-                    stats_push_count as f64 / elapsed,
+                    "Capture stats: capture={capture_fps:.1}fps, \
+                     encoder_push={push_fps:.1}fps (target={}fps), \
+                     skipped={}, duplicated={}, dropped={}, \
+                     drop_rate={drop_rate:.1}%, pacing_ratio={pacing_ratio:.3}",
                     settings.capture_fps,
                     stats_skip_count,
                     stats_dup_count,
-                    pacing_ratio,
+                    stats_drop_count,
+                    drop_rate = drop_rate * 100.0,
                 );
                 session_push_total += stats_push_count;
                 stats_capture_count = 0;
                 stats_push_count = 0;
                 stats_dup_count = 0;
                 stats_skip_count = 0;
+                stats_drop_count = 0;
                 last_stats_us = now_us;
             } else if last_stats_us == 0 {
                 last_stats_us = now_us;

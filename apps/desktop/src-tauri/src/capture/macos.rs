@@ -287,6 +287,8 @@ impl ScreenCapture for MacOSCapture {
             target_fps: config.target_fps,
             width,
             height,
+            adapter_index: config.adapter_index,
+            display_index: config.display_index,
         });
         self.running = true;
 
@@ -337,5 +339,9 @@ impl ScreenCapture for MacOSCapture {
             .map_err(|e| CaptureError::Platform(format!("Buffer lock poisoned: {e}")))?;
 
         Ok(buf.pop_front())
+    }
+
+    fn nv12_active(&self) -> bool {
+        true
     }
 }

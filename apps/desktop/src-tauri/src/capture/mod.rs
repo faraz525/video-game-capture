@@ -66,6 +66,10 @@ pub struct CaptureConfig {
     pub width: u32,
     /// Capture height in pixels (0 = native resolution).
     pub height: u32,
+    /// GPU adapter index for multi-monitor setups (0 = primary).
+    pub adapter_index: u32,
+    /// Display index on the selected adapter (0 = primary).
+    pub display_index: u32,
 }
 
 impl Default for CaptureConfig {
@@ -74,6 +78,8 @@ impl Default for CaptureConfig {
             target_fps: 60,
             width: 1920,
             height: 1080,
+            adapter_index: 0,
+            display_index: 0,
         }
     }
 }
@@ -96,4 +102,11 @@ pub trait ScreenCapture: Send {
 
     /// Poll for the next available frame. Returns None if no new frame is ready.
     fn poll_frame(&mut self) -> Result<Option<CapturedFrame>, CaptureError>;
+
+    /// Returns whether NV12 GPU conversion is active.
+    /// On Windows, this is true when D3D11 VideoProcessor initialized successfully.
+    /// On macOS, ScreenCaptureKit always delivers NV12. Mock returns false.
+    fn nv12_active(&self) -> bool {
+        false
+    }
 }

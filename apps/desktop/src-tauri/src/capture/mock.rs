@@ -156,6 +156,7 @@ mod tests {
             target_fps: 60,
             width: 64,
             height: 64,
+            ..Default::default()
         };
         capture.start(config).unwrap();
 
@@ -186,6 +187,7 @@ mod tests {
             target_fps: 60,
             width: 2,
             height: 2,
+            ..Default::default()
         };
         capture.start(config).unwrap();
 
@@ -200,9 +202,10 @@ mod tests {
         let mut capture = MockCapture::new(clock);
 
         let config = CaptureConfig {
-            target_fps: 1000, // high fps so we don't have to sleep
+            target_fps: 1000,
             width: 1,
             height: 1,
+            ..Default::default()
         };
         capture.start(config).unwrap();
 
@@ -238,6 +241,7 @@ mod tests {
             target_fps: 1000,
             width: 1,
             height: 1,
+            ..Default::default()
         };
         capture.start(config).unwrap();
 

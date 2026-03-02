@@ -25,7 +25,18 @@ pub enum StreamingEncoderError {
     Process(String),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("encoder stalled: {0}")]
+    Stalled(String),
 }
+
+/// Stall detection thresholds.
+/// If no chunk is produced after this many consecutive polls with frames pushed,
+/// the encoder is considered stalled.
+const STALL_EMPTY_POLL_THRESHOLD: u64 = 20;
+/// If no output after this many input frames, the encoder is stalled.
+const STALL_INPUT_FRAME_THRESHOLD: u64 = 30;
+/// If no chunk produced in this many microseconds, the encoder is stalled.
+const STALL_TIME_THRESHOLD_US: u64 = 5_000_000; // 5 seconds
 
 /// Configuration for the streaming encoder.
 #[derive(Debug, Clone)]
@@ -75,6 +86,15 @@ pub struct FfmpegStreamingEncoder {
     /// SyncClock timestamp (us) of the first frame pushed. Used to offset
     /// synthetic chunk timestamps so they align with the shared clock.
     first_frame_timestamp_us: Option<u64>,
+    /// Skip hardware codecs and use only software (libx264) on start.
+    force_software: bool,
+    // -- Stall detection state --
+    /// Number of consecutive polls that returned no chunk while frames were pushed.
+    consecutive_empty_polls: u64,
+    /// Number of frames pushed since last chunk was received.
+    frames_since_last_chunk: u64,
+    /// Timestamp (us) of the last received chunk. None until first chunk.
+    last_chunk_time_us: Option<u64>,
 }
 
 impl FfmpegStreamingEncoder {
@@ -88,7 +108,17 @@ impl FfmpegStreamingEncoder {
             frame_count: 0,
             dropped_frame_count: 0,
             first_frame_timestamp_us: None,
+            force_software: false,
+            consecutive_empty_polls: 0,
+            frames_since_last_chunk: 0,
+            last_chunk_time_us: None,
         }
+    }
+
+    /// Force software-only codec (libx264) on next start. Used after hardware
+    /// encoder stall to restart with a known-working codec.
+    pub fn set_force_software(&mut self, force: bool) {
+        self.force_software = force;
     }
 }
 
@@ -106,7 +136,7 @@ impl StreamingEncoder for FfmpegStreamingEncoder {
             config.width, config.height, config.fps
         );
 
-        let codecs = build_codec_list(&ffmpeg_path);
+        let codecs = build_codec_list(&ffmpeg_path, self.force_software);
         let mut last_err = None;
 
         for (codec, codec_args) in &codecs {
@@ -182,6 +212,7 @@ impl StreamingEncoder for FfmpegStreamingEncoder {
         match tx.try_send(data) {
             Ok(()) => {
                 self.frame_count += 1;
+                self.frames_since_last_chunk += 1;
                 Ok(())
             }
             Err(mpsc::TrySendError::Full(_)) => {
@@ -201,8 +232,53 @@ impl StreamingEncoder for FfmpegStreamingEncoder {
     fn poll_chunk(&mut self) -> Result<Option<EncodedChunk>, StreamingEncoderError> {
         let rx = self.chunk_rx.as_ref().ok_or(StreamingEncoderError::NotRunning)?;
         match rx.try_recv() {
-            Ok(chunk) => Ok(Some(chunk)),
-            Err(mpsc::TryRecvError::Empty) => Ok(None),
+            Ok(chunk) => {
+                // Reset stall counters on successful chunk receive
+                self.consecutive_empty_polls = 0;
+                self.frames_since_last_chunk = 0;
+                self.last_chunk_time_us = Some(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_micros() as u64,
+                );
+                Ok(Some(chunk))
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                // Track consecutive empty polls for stall detection.
+                // Only count if we've been pushing frames (frame_count > 0).
+                if self.frame_count > 0 {
+                    self.consecutive_empty_polls += 1;
+                }
+
+                // Check stall conditions
+                if self.consecutive_empty_polls >= STALL_EMPTY_POLL_THRESHOLD
+                    && self.frames_since_last_chunk >= STALL_INPUT_FRAME_THRESHOLD
+                {
+                    return Err(StreamingEncoderError::Stalled(format!(
+                        "{} empty polls, {} frames with no output",
+                        self.consecutive_empty_polls, self.frames_since_last_chunk,
+                    )));
+                }
+
+                // Time-based stall: no chunk in 5 seconds after receiving at least one
+                if let Some(last_time) = self.last_chunk_time_us {
+                    let now_us = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_micros() as u64;
+                    if now_us.saturating_sub(last_time) >= STALL_TIME_THRESHOLD_US
+                        && self.frames_since_last_chunk > 0
+                    {
+                        return Err(StreamingEncoderError::Stalled(format!(
+                            "no chunk in {}ms",
+                            (now_us - last_time) / 1000,
+                        )));
+                    }
+                }
+
+                Ok(None)
+            }
             Err(mpsc::TryRecvError::Disconnected) => {
                 Err(StreamingEncoderError::Process("chunk reader disconnected".into()))
             }
@@ -257,6 +333,9 @@ impl StreamingEncoder for FfmpegStreamingEncoder {
         self.frame_count = 0;
         self.dropped_frame_count = 0;
         self.first_frame_timestamp_us = None;
+        self.consecutive_empty_polls = 0;
+        self.frames_since_last_chunk = 0;
+        self.last_chunk_time_us = None;
         Ok(())
     }
 
@@ -295,42 +374,48 @@ fn compute_bitrate(width: u32, height: u32, fps: u32) -> (String, String, String
 }
 
 /// Build the codec priority list based on what's available.
-fn build_codec_list(ffmpeg_path: &str) -> Vec<(String, Vec<String>)> {
+///
+/// When `force_software` is true, skips all hardware codecs (NVENC, VideoToolbox)
+/// and only uses libx264. Used after hardware encoder stall to restart with a
+/// known-working codec.
+fn build_codec_list(ffmpeg_path: &str, force_software: bool) -> Vec<(String, Vec<String>)> {
     let mut codecs = Vec::new();
 
-    #[cfg(target_os = "macos")]
-    {
-        if is_codec_available(ffmpeg_path, "h264_videotoolbox") {
-            // Baseline profile = no B-frames → 1 GOP period less latency.
-            // prio_speed hint → VideoToolbox prioritizes encoding speed.
-            // Bitrate-based instead of quality-scale for predictable output.
-            codecs.push((
-                "h264_videotoolbox".to_string(),
-                vec![
-                    "-allow_sw".to_string(), "1".to_string(),
-                    "-realtime".to_string(), "1".to_string(),
-                    "-prio_speed".to_string(), "1".to_string(),
-                    "-profile:v".to_string(), "baseline".to_string(),
-                ],
-            ));
+    if !force_software {
+        #[cfg(target_os = "macos")]
+        {
+            if is_codec_available(ffmpeg_path, "h264_videotoolbox") {
+                // Baseline profile = no B-frames → 1 GOP period less latency.
+                // prio_speed hint → VideoToolbox prioritizes encoding speed.
+                // Bitrate-based instead of quality-scale for predictable output.
+                codecs.push((
+                    "h264_videotoolbox".to_string(),
+                    vec![
+                        "-allow_sw".to_string(), "1".to_string(),
+                        "-realtime".to_string(), "1".to_string(),
+                        "-prio_speed".to_string(), "1".to_string(),
+                        "-profile:v".to_string(), "baseline".to_string(),
+                    ],
+                ));
+            }
         }
-    }
 
-    #[cfg(target_os = "windows")]
-    {
-        if is_codec_available(ffmpeg_path, "h264_nvenc") {
-            // Low-latency tuning for real-time gaming capture.
-            // Baseline profile avoids B-frames for lower latency.
-            codecs.push((
-                "h264_nvenc".to_string(),
-                vec![
-                    "-preset".to_string(), "p4".to_string(),
-                    "-tune".to_string(), "ll".to_string(),
-                    "-profile:v".to_string(), "baseline".to_string(),
-                    "-rc".to_string(), "vbr".to_string(),
-                    "-cq".to_string(), "23".to_string(),
-                ],
-            ));
+        #[cfg(target_os = "windows")]
+        {
+            if is_codec_available(ffmpeg_path, "h264_nvenc") {
+                // Low-latency tuning for real-time gaming capture.
+                // Baseline profile avoids B-frames for lower latency.
+                codecs.push((
+                    "h264_nvenc".to_string(),
+                    vec![
+                        "-preset".to_string(), "p4".to_string(),
+                        "-tune".to_string(), "ll".to_string(),
+                        "-profile:v".to_string(), "baseline".to_string(),
+                        "-rc".to_string(), "vbr".to_string(),
+                        "-cq".to_string(), "23".to_string(),
+                    ],
+                ));
+            }
         }
     }
 
