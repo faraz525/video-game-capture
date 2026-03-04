@@ -1,0 +1,30 @@
+Codemap Diff Report
+Generated: 2026-02-26
+Branch: feat/production-readiness
+
+Previous version: NONE (first generation)
+Diff percentage: N/A (100% new content)
+
+Files generated:
+  codemaps/architecture.md  — Overall system architecture, data flow, traits, Tauri integration
+  codemaps/backend.md       — Rust module map, public API per module, crate usage, test distribution
+  codemaps/frontend.md      — React component tree, hooks, routing, IPC mapping, TS types
+  codemaps/data.md          — All data models, .gameclip format, serialization boundaries, config
+
+CLAUDE.md updates applied:
+  - Test count: 173 -> 183
+  - engine.rs description: added upload_cancel, FIFO drain loop, writer thread
+  - encoder.rs description: platform-aware codec priority (VideoToolbox on macOS, NVENC on Windows)
+  - streaming.rs description: added GOP_MULTIPLIER detail
+  - lib.rs description: expanded with plugins, logging, command count
+  - Settings page description: added HuggingFace config details
+  - Implementation status: updated to reflect Steps 1-10 complete with production-readiness work
+
+Codebase stats:
+  Rust files:     37 (.rs)
+  Frontend files: 15 (.tsx/.ts)
+  Rust tests:     183 (all passing)
+  Frontend tests: 3 (all passing)
+  IPC commands:   15
+  Tauri events:   2
+  Modules:        9 Rust + 3 frontend directories
