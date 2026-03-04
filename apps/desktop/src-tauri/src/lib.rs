@@ -100,7 +100,11 @@ pub fn run() {
                 if let Ok(exe_path) = std::env::current_exe() {
                     if let Some(exe_dir) = exe_path.parent() {
                         let triple = env!("TAURI_ENV_TARGET_TRIPLE");
-                        let sidecar_name = format!("ffmpeg-{triple}");
+                        let sidecar_name = if triple.contains("windows") {
+                            format!("ffmpeg-{triple}.exe")
+                        } else {
+                            format!("ffmpeg-{triple}")
+                        };
                         let sidecar_path = exe_dir.join(&sidecar_name);
                         if sidecar_path.exists() {
                             let path_str = sidecar_path.to_string_lossy().to_string();

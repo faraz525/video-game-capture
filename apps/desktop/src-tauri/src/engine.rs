@@ -200,7 +200,21 @@ pub fn start_capture(state: &EngineState) -> Result<(), Box<dyn std::error::Erro
         let active_pixel_format = capture_pixel_format(screen.as_ref());
         let mut streaming_encoder: Option<Box<dyn StreamingEncoder>> = None;
         let mut force_software_codec = false;
-        {
+        #[cfg(target_os = "windows")]
+        let streaming_allowed = if active_pixel_format == FramePixelFormat::Nv12 {
+            true
+        } else {
+            warn!(
+                "Windows capture running in BGRA fallback mode; disabling live streaming encoder \
+                 to avoid geometry mismatch with desktop-duplication native resolution"
+            );
+            false
+        };
+
+        #[cfg(not(target_os = "windows"))]
+        let streaming_allowed = true;
+
+        if streaming_allowed {
             let streaming_config = StreamingConfig {
                 width: settings.capture_width,
                 height: settings.capture_height,

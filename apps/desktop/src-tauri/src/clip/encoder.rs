@@ -226,9 +226,25 @@ pub(crate) fn find_ffmpeg() -> Result<String, EncoderError> {
 
     // 3. Check if bundled next to executable
     if let Ok(exe_dir) = std::env::current_exe().map(|p| p.parent().unwrap_or(Path::new(".")).to_path_buf()) {
-        let sidecar = exe_dir.join("ffmpeg").with_extension(std::env::consts::EXE_EXTENSION);
-        if sidecar.exists() {
-            return Ok(sidecar.to_string_lossy().to_string());
+        // Tauri externalBin naming: ffmpeg-<target-triple>[.exe]
+        if let Some(triple) = option_env!("TAURI_ENV_TARGET_TRIPLE") {
+            let sidecar_name = if triple.contains("windows") {
+                format!("ffmpeg-{triple}.exe")
+            } else {
+                format!("ffmpeg-{triple}")
+            };
+            let sidecar = exe_dir.join(sidecar_name);
+            if sidecar.exists() {
+                return Ok(sidecar.to_string_lossy().to_string());
+            }
+        }
+
+        // Generic fallback next to executable
+        let fallback = exe_dir
+            .join("ffmpeg")
+            .with_extension(std::env::consts::EXE_EXTENSION);
+        if fallback.exists() {
+            return Ok(fallback.to_string_lossy().to_string());
         }
     }
 

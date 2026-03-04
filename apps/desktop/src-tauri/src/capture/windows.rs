@@ -313,6 +313,22 @@ impl WindowsCapture {
 
         let reader = self.reader.as_mut().ok_or(CaptureError::NotStarted)?;
 
+        // Read dimensions from the DXGI texture when available.
+        // Desktop Duplication always captures native output resolution; if this
+        // differs from configured settings, we must trust the texture metadata
+        // to keep frame geometry consistent for downstream encoders.
+        let texture_dims = unsafe {
+            let raw_texture = texture.as_raw_ref();
+            match raw_texture.cast::<ID3D11Texture2D>() {
+                Ok(tex2d) => {
+                    let mut desc = D3D11_TEXTURE2D_DESC::default();
+                    tex2d.GetDesc(&mut desc);
+                    Some((desc.Width, desc.Height))
+                }
+                Err(_) => None,
+            }
+        };
+
         self.frame_buffer.clear();
         if let Err(e) = reader.get_data(&mut self.frame_buffer, &texture) {
             error!("TextureReader error: {e:?}");
@@ -324,7 +340,12 @@ impl WindowsCapture {
         }
 
         let total_pixels = self.frame_buffer.len() / 4;
-        let (width, height) = if config.width > 0 && config.height > 0 {
+        let (width, height) = if let Some((w, h)) = texture_dims {
+            (w, h)
+        } else if config.width > 0
+            && config.height > 0
+            && (config.width as usize * config.height as usize) == total_pixels
+        {
             (config.width, config.height)
         } else if total_pixels > 0 {
             let w_est = (total_pixels as f64).sqrt();
